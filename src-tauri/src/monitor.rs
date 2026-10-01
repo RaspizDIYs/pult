@@ -6,7 +6,8 @@ use crate::commands::{
 use crate::engine::facts::{CheckKey, CheckResult, CycleGate, Facts, HostFacts};
 use crate::engine::{self, NodeState};
 use crate::inventory::{self, Inventory, InventoryState};
-use crate::{probes, store, system};
+use crate::notify::Notifier;
+use crate::{notify, probes, store, system, tray};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -38,6 +39,9 @@ struct State {
     gate: CycleGate,
     states: HashMap<String, NodeState>,
     taken_at: OffsetDateTime,
+    notifier: Notifier,
+    /// Что последний раз показано в трее; None — ещё ничего.
+    tray_roots: Option<usize>,
 }
 
 impl Monitor {
@@ -46,6 +50,10 @@ impl Monitor {
             log::error!("папка данных {} не создаётся: {e}", data_dir.display());
         }
         let state = State::new(&data_dir, store::load_settings(&data_dir));
+        // Настройка — правда: если автозапуск сняли или включили мимо Пульта, вернём как в ней.
+        if let Err(e) = system::set_autostart(&app, state.settings.autostart) {
+            log::warn!("{e}");
+        }
         let monitor = Arc::new(Self { app, data_dir, state: Mutex::new(state), recheck: Notify::new() });
         monitor.emit(EVENT_SNAPSHOT, monitor.snapshot());
         tauri::async_runtime::spawn(monitor.clone().schedule());
@@ -62,8 +70,30 @@ impl Monitor {
         self.lock().snapshot()
     }
 
-    pub fn recheck(&self) {
-        self.recheck.notify_one();
+    /// Без id — внеочередной полный цикл. С id — сразу локальные проверки одного узла,
+    /// не дожидаясь цикла: человек нажал «проверить» и ждёт ответа про этот узел.
+    pub fn recheck(self: &Arc<Self>, id: Option<String>) {
+        match id {
+            None => self.recheck.notify_one(),
+            Some(id) => {
+                tauri::async_runtime::spawn(self.clone().recheck_node(id));
+            }
+        }
+    }
+
+    async fn recheck_node(self: Arc<Self>, id: String) {
+        let Some(node) = self.lock().inventory.inventory().nodes.into_iter().find(|n| n.id == id) else { return };
+        let results = probes::run_local(std::slice::from_ref(&node)).await;
+        let mut s = self.lock();
+        // Пока шли проверки, карта могла смениться — тогда номера проверок уже о другом.
+        if !s.inventory.inventory().nodes.contains(&node) {
+            return;
+        }
+        s.facts.record_local(results);
+        // Оценка в том же цикле: подтверждение по-прежнему только по циклам.
+        let states = s.evaluate(&self.data_dir);
+        self.after_change(&mut s);
+        self.emit(EVENT_STATES, StatesEvent { cycle: s.cycle, states });
     }
 
     pub fn history(&self, id: &str, limit: usize) -> Result<Vec<HistoryEntry>, String> {
@@ -76,6 +106,9 @@ impl Monitor {
 
     pub fn set_settings(&self, mut settings: Settings) -> Result<Settings, String> {
         settings.inventory_path = settings.inventory_path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+        if settings.autostart != self.lock().settings.autostart {
+            system::set_autostart(&self.app, settings.autostart)?;
+        }
         store::save_settings(&self.data_dir, &settings)?;
         let mut s = self.lock();
         let path_changed = s.settings.inventory_path != settings.inventory_path;
@@ -101,6 +134,7 @@ impl Monitor {
     fn reload(&self, s: &mut MutexGuard<'_, State>) -> bool {
         let Some(map_changed) = s.reload(&self.data_dir) else { return false };
         if map_changed {
+            self.after_change(s);
             self.recheck.notify_one();
         }
         self.emit(EVENT_SNAPSHOT, s.snapshot());
@@ -132,10 +166,27 @@ impl Monitor {
 
     async fn cycle(&self, woke_at: Option<OffsetDateTime>) {
         let (inv, cycle) = self.lock().begin_cycle(woke_at);
-        let results = probes::run_local(&inv).await;
+        let results = probes::run_local(&inv.nodes).await;
         let mut s = self.lock();
-        if let Some(states) = s.finish_cycle(cycle, &inv, results, &self.data_dir) {
-            self.emit(EVENT_STATES, StatesEvent { cycle, states });
+        let Some(states) = s.finish_cycle(cycle, &inv, results, &self.data_dir) else { return };
+        let inv = s.inventory.inventory();
+        let st = &mut *s;
+        let alerts = st.notifier.on_cycle(cycle, &inv, &st.states);
+        // Выключенные уведомления не копятся: состояние уведомителя всё равно движется,
+        // и включение не вывалит старое разом.
+        if s.settings.notifications {
+            notify::send(&self.app, alerts);
+        }
+        self.after_change(&mut s);
+        self.emit(EVENT_STATES, StatesEvent { cycle, states });
+    }
+
+    /// Трей — по текущим корням, без ожидания подтверждения: это сводка, а не тревога.
+    fn after_change(&self, s: &mut State) {
+        let roots = s.states.values().filter(|st| st.is_root).count();
+        if s.tray_roots != Some(roots) {
+            s.tray_roots = Some(roots);
+            tray::update(&self.app, roots);
         }
     }
 
@@ -173,6 +224,8 @@ impl State {
             gate: CycleGate::default(),
             states: HashMap::new(),
             taken_at: engine::now(),
+            notifier: Notifier::default(),
+            tray_roots: None,
         };
         state.evaluate(data_dir);
         state
@@ -224,7 +277,7 @@ impl State {
         if !self.gate.accepts(cycle) {
             return None;
         }
-        self.facts.local.extend(results);
+        self.facts.record_local(results);
         self.gate.finish(cycle);
         let now = engine::now();
         // ponytail: заглушка до стыковки со сборщиком (collect/): у каждого узла со «сбор»
@@ -361,7 +414,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         for _ in 0..2 {
             let (inv, cycle) = state.begin_cycle(None);
-            let results = rt.block_on(probes::run_local(&inv));
+            let results = rt.block_on(probes::run_local(&inv.nodes));
             state.finish_cycle(cycle, &inv, results, &data).unwrap();
         }
         let snapshot = state.snapshot();

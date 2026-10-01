@@ -159,6 +159,8 @@ export const pult = {
   getSettings: () => call<Settings>("get_settings"),
   setSettings: (settings: Settings) => call<Settings>("set_settings", { settings }),
   checkEnvironment: () => call<EnvCheck[]>("check_environment"),
+  // Ссылки из инвентаря открывает ядро в системном браузере: внутри окна Tauri `<a target>` не работает.
+  openUrl: (url: string) => call<void>("open_url", { url }),
 
   onSnapshot: (cb: (s: Snapshot) => void) => on("pult://snapshot", cb),
   onStates: (cb: (e: StatesEvent) => void) => on("pult://states", cb),

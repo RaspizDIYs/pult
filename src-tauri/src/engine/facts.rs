@@ -66,6 +66,18 @@ pub struct Facts {
     pub woke_at: Option<OffsetDateTime>,
 }
 
+impl Facts {
+    /// Свежее не перетирается более старым: проверка узла вне очереди и цикл
+    /// возвращаются в любом порядке.
+    pub fn record_local(&mut self, results: Vec<(CheckKey, CheckResult)>) {
+        for (key, r) in results {
+            if self.local.get(&key).is_none_or(|old| old.measured_at <= r.measured_at) {
+                self.local.insert(key, r);
+            }
+        }
+    }
+}
+
 /// Итог одного сеанса сбора с узла.
 #[derive(Debug, Clone)]
 pub struct HostFacts {

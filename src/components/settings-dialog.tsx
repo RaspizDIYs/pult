@@ -1,4 +1,5 @@
-import { CircleCheck, CircleX, FolderOpen, TriangleAlert } from "lucide-react";
+import { open as pickDirectory } from "@tauri-apps/plugin-dialog";
+import { CircleCheck, CircleX, FolderOpen, FolderSearch, TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -64,6 +65,14 @@ export function InventoryPathForm({ store, compact = false }: { store: ReturnTyp
     await save({ inventoryPath: path.trim() || null });
   }
 
+  // Выбранный каталог сохраняем сразу: человек уже показал, что хочет именно его.
+  async function choose() {
+    const dir = await pickDirectory({ directory: true, multiple: false, title: "Каталог с инвентарь.yaml", defaultPath: path || undefined });
+    if (typeof dir !== "string") return;
+    setPath(dir);
+    await save({ inventoryPath: dir });
+  }
+
   return (
     <form onSubmit={submit} className="space-y-1.5">
       <Label htmlFor="inventory-path">Каталог с инвентарём</Label>
@@ -77,6 +86,11 @@ export function InventoryPathForm({ store, compact = false }: { store: ReturnTyp
           autoComplete="off"
           className="font-mono"
         />
+        {isTauri && (
+          <Button type="button" variant="outline" onClick={() => void choose()} disabled={!settings || saving}>
+            <FolderSearch /> Выбрать…
+          </Button>
+        )}
         <Button type="submit" disabled={!settings || saving || path.trim() === (settings.inventoryPath ?? "")}>
           <FolderOpen /> {compact ? "Сохранить" : "Сохранить путь"}
         </Button>

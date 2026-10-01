@@ -512,6 +512,9 @@ async function call(cmd: string, args: Record<string, unknown> = {}): Promise<un
       }
       return settings;
     }
+    case "open_url":
+      window.open(args.url as string, "_blank", "noopener,noreferrer");
+      return null;
     case "check_environment": {
       const res: EnvCheck[] = [
         { name: "ssh", ok: true, detail: "/usr/bin/ssh (OpenSSH_9.8)" },

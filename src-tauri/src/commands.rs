@@ -139,12 +139,23 @@ pub fn get_snapshot(core: Core<'_>) -> Snapshot {
     core.snapshot()
 }
 
-/// Внеочередной цикл; результат придёт событием `pult://states`. Цикл всегда полный:
-/// локальные проверки дешёвые, а `id` пригодится, когда появится сбор по ssh.
+/// Внеочередная проверка; результат придёт событием `pult://states`. С `id` —
+/// сразу локальные проверки этого узла, без — полный цикл.
 #[tauri::command]
 pub fn recheck(core: Core<'_>, id: Option<String>) {
-    let _ = id;
-    core.recheck();
+    core.recheck(id);
+}
+
+/// Ссылка из инвентаря — в системный браузер. Инвентарь — данные из репозитория,
+/// поэтому схему проверяем и здесь, а не только в интерфейсе: только http и https.
+#[tauri::command]
+pub fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    match reqwest::Url::parse(&url).map(|u| u.scheme().to_string()) {
+        Ok(scheme) if scheme == "http" || scheme == "https" => {}
+        _ => return Err(format!("открываются только ссылки http и https: {url}")),
+    }
+    app.opener().open_url(url, None::<&str>).map_err(|e| format!("ссылка не открылась: {e}"))
 }
 
 #[tauri::command]

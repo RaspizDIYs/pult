@@ -3,7 +3,7 @@
 
 use crate::engine::facts::{CheckKey, CheckResult, ResultKind};
 use crate::engine::now;
-use crate::inventory::{Check, CheckKind, Inventory};
+use crate::inventory::{Check, CheckKind, Node};
 use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, TcpStream};
 use tokio::task::JoinSet;
@@ -15,11 +15,11 @@ const HTTP_TIMEOUT_MS: u64 = 5000;
 /// Цикл не должен растягиваться дольше интервала из-за одного таймаута из инвентаря.
 const MAX_TIMEOUT_MS: u64 = 20_000;
 
-/// Все локальные проверки инвентаря параллельно; каждая ограничена своим таймаутом,
+/// Все локальные проверки узлов параллельно; каждая ограничена своим таймаутом,
 /// поэтому цикл длится не дольше самой долгой из них.
-pub async fn run_local(inv: &Inventory) -> Vec<(CheckKey, CheckResult)> {
+pub async fn run_local(nodes: &[Node]) -> Vec<(CheckKey, CheckResult)> {
     let mut set = JoinSet::new();
-    for node in &inv.nodes {
+    for node in nodes {
         for (i, check) in node.checks.iter().enumerate().filter(|(_, c)| c.from.is_none()) {
             let key = (node.id.clone(), i);
             let check = check.clone();

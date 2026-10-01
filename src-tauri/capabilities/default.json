@@ -7,6 +7,7 @@
     "core:default",
     "updater:default",
     "process:allow-restart",
-    "log:default"
+    "log:default",
+    "dialog:allow-open"
   ]
 }

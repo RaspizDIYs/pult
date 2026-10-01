@@ -340,13 +340,22 @@ function isWebUrl(url: string): boolean {
 }
 
 function Links({ links }: { links: NodeView["links"] }) {
+  const [error, setError] = useState<string | null>(null);
   return (
     <Section title="Ссылки">
       <ul className="space-y-1">
         {links.map((l) => (
           <li key={l.url} className="flex items-center gap-1.5 text-sm">
             {isWebUrl(l.url) ? (
-              <a href={l.url} target="_blank" rel="noreferrer noopener" className="inline-flex shrink-0 items-center gap-1 font-medium underline underline-offset-2">
+              <a
+                href={l.url}
+                onClick={(e) => {
+                  e.preventDefault();
+                  setError(null);
+                  pult.openUrl(l.url).catch((err) => setError(errText(err)));
+                }}
+                className="inline-flex shrink-0 items-center gap-1 font-medium underline underline-offset-2"
+              >
                 {l.title}
                 <ExternalLink className="size-3" aria-hidden />
               </a>
@@ -360,6 +369,7 @@ function Links({ links }: { links: NodeView["links"] }) {
           </li>
         ))}
       </ul>
+      {error && <p className="mt-1 text-xs text-root-fg">{error}</p>}
     </Section>
   );
 }

@@ -4,6 +4,7 @@ use crate::commands::EnvCheck;
 use crate::inventory::{key_paths, Inventory, FILE_NAME};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use tauri::AppHandle;
 
 /// Путь к программе по PATH. Ищем сами, а не полагаемся на оболочку: путь показывается
 /// в проверке окружения, и на винде дочерние процессы запускаются без оболочки.
@@ -61,4 +62,20 @@ pub fn check_environment(inventory_path: Option<&str>, inv: &Inventory) -> Vec<E
         checks.push(EnvCheck { name: "ключ".into(), ok, detail });
     }
     checks
+}
+
+/// Автозапуск при входе в систему — как в настройке.
+pub fn set_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    // Из режима разработки в автозапуск попал бы отладочный бинарник из target/.
+    if cfg!(debug_assertions) {
+        log::info!("режим разработки: автозапуск не трогаю (в настройке {enabled})");
+        return Ok(());
+    }
+    let launch = app.autolaunch();
+    if launch.is_enabled().map_err(|e| format!("автозапуск: {e}"))? == enabled {
+        return Ok(());
+    }
+    if enabled { launch.enable() } else { launch.disable() }
+        .map_err(|e| format!("автозапуск не {}: {e}", if enabled { "включился" } else { "выключился" }))
 }
