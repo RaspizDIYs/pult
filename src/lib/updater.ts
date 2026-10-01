@@ -27,7 +27,7 @@ export function useUpdater() {
     } catch (e) {
       // Без сети или VPN проверка падает регулярно — это не повод мешать работе окном.
       const error = String(e);
-      void warn(`проверка обновлений: ${error}`);
+      void warn(`проверка обновлений: ${error}`).catch(() => {});
       setState((s) => ({ ...s, checkedAt: new Date(), error }));
     }
   }, []);
@@ -47,7 +47,7 @@ export function useUpdater() {
       await relaunch();
     } catch (e) {
       const error = String(e);
-      void warn(`установка обновления: ${error}`);
+      void warn(`установка обновления: ${error}`).catch(() => {});
       setState((s) => ({ ...s, installing: false, error }));
     }
   }, [state.update]);

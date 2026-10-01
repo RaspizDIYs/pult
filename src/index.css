@@ -39,6 +39,26 @@
     --color-card: var(--card);
     --color-foreground: var(--foreground);
     --color-background: var(--background);
+    --color-ok: var(--ok);
+    --color-ok-bg: var(--ok-bg);
+    --color-ok-fg: var(--ok-fg);
+    --color-root: var(--root);
+    --color-root-bg: var(--root-bg);
+    --color-root-fg: var(--root-fg);
+    --color-cascade: var(--cascade);
+    --color-cascade-bg: var(--cascade-bg);
+    --color-cascade-fg: var(--cascade-fg);
+    --color-unknown: var(--unknown);
+    --color-unknown-bg: var(--unknown-bg);
+    --color-unknown-fg: var(--unknown-fg);
+    --color-stale: var(--stale);
+    --color-stale-bg: var(--stale-bg);
+    --color-stale-fg: var(--stale-fg);
+    --color-unchecked: var(--unchecked);
+    --color-unchecked-fg: var(--unchecked-fg);
+    --color-warn: var(--warn);
+    --color-warn-bg: var(--warn-bg);
+    --color-warn-fg: var(--warn-fg);
     --radius-sm: calc(var(--radius) * 0.6);
     --radius-md: calc(var(--radius) * 0.8);
     --radius-lg: var(--radius);
@@ -49,6 +69,30 @@
 }
 
 :root {
+    color-scheme: light;
+    /* Состояния узла (контракт, раздел 2). Три тона на состояние: акцент (линии, точки),
+       фон карточки и цвет текста на этом фоне. Состояние никогда не передаётся
+       одним цветом: рядом всегда значок и подпись. */
+    --ok: oklch(0.62 0.15 150);
+    --ok-bg: oklch(0.96 0.045 150);
+    --ok-fg: oklch(0.4 0.11 150);
+    --root: oklch(0.58 0.22 27);
+    --root-bg: oklch(0.95 0.045 25);
+    --root-fg: oklch(0.45 0.18 27);
+    --cascade: oklch(0.72 0.09 22);
+    --cascade-bg: oklch(0.975 0.015 22);
+    --cascade-fg: oklch(0.48 0.1 22);
+    --unknown: oklch(0.6 0.04 250);
+    --unknown-bg: oklch(0.96 0.012 250);
+    --unknown-fg: oklch(0.42 0.04 250);
+    --stale: oklch(0.74 0.14 80);
+    --stale-bg: oklch(0.97 0.04 88);
+    --stale-fg: oklch(0.44 0.1 70);
+    --unchecked: oklch(0.72 0 0);
+    --unchecked-fg: oklch(0.5 0 0);
+    --warn: oklch(0.7 0.15 70);
+    --warn-bg: oklch(0.97 0.04 85);
+    --warn-fg: oklch(0.42 0.1 65);
     --background: oklch(1 0 0);
     --foreground: oklch(0.145 0 0);
     --card: oklch(1 0 0);
@@ -84,6 +128,27 @@
 }
 
 .dark {
+    color-scheme: dark;
+    --ok: oklch(0.72 0.17 150);
+    --ok-bg: oklch(0.27 0.05 150);
+    --ok-fg: oklch(0.86 0.14 150);
+    --root: oklch(0.68 0.22 25);
+    --root-bg: oklch(0.29 0.09 25);
+    --root-fg: oklch(0.86 0.1 25);
+    --cascade: oklch(0.56 0.1 22);
+    --cascade-bg: oklch(0.24 0.035 22);
+    --cascade-fg: oklch(0.78 0.08 22);
+    --unknown: oklch(0.6 0.04 250);
+    --unknown-bg: oklch(0.25 0.015 250);
+    --unknown-fg: oklch(0.8 0.04 250);
+    --stale: oklch(0.75 0.13 85);
+    --stale-bg: oklch(0.27 0.04 85);
+    --stale-fg: oklch(0.86 0.1 85);
+    --unchecked: oklch(0.5 0 0);
+    --unchecked-fg: oklch(0.72 0 0);
+    --warn: oklch(0.78 0.14 75);
+    --warn-bg: oklch(0.28 0.05 80);
+    --warn-fg: oklch(0.87 0.1 85);
     --background: oklch(0.145 0 0);
     --foreground: oklch(0.985 0 0);
     --card: oklch(0.205 0 0);
@@ -127,4 +192,28 @@
   html {
     @apply font-sans;
     }
+}
+
+/* Карта: xyflow приносит свои цвета, подменяем их токенами приложения. */
+.react-flow {
+  --xy-background-color: var(--background);
+  --xy-node-border-radius: var(--radius-lg);
+  --xy-controls-button-background-color: var(--card);
+  --xy-controls-button-background-color-hover: var(--muted);
+  --xy-controls-button-color: var(--foreground);
+  --xy-controls-button-color-hover: var(--foreground);
+  --xy-controls-button-border-color: var(--border);
+  --xy-minimap-background-color: var(--card);
+  --xy-minimap-mask-background-color: color-mix(in oklch, var(--background) 70%, transparent);
+  --xy-attribution-background-color: transparent;
+}
+.react-flow__node { cursor: pointer; }
+/* Фокус с клавиатуры виден на самой карточке, а не на невидимой обёртке xyflow. */
+.react-flow__node:focus-visible { outline: none; }
+.react-flow__node:focus-visible > div { outline: 3px solid var(--foreground); outline-offset: 3px; }
+.react-flow__edge-path { transition: stroke-opacity 0.15s, stroke-width 0.15s; }
+.react-flow__attribution { font-size: 9px; opacity: 0.6; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
