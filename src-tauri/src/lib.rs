@@ -1,10 +1,13 @@
+mod commands;
 mod engine;
 mod inventory;
+mod monitor;
 mod probes;
 mod sources;
 mod store;
+mod system;
 
-use tauri::{AppHandle, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, WebviewWindowBuilder};
 use tauri_plugin_log::{log, Target, TargetKind};
 use tauri_plugin_updater::UpdaterExt;
 
@@ -27,8 +30,21 @@ pub fn run() {
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .invoke_handler(tauri::generate_handler![
+            commands::get_snapshot,
+            commands::recheck,
+            commands::get_history,
+            commands::get_settings,
+            commands::set_settings,
+            commands::check_environment,
+            commands::open_logs,
+            commands::close_logs,
+        ])
         .setup(move |app| {
             let Some(apply) = cli_apply else {
+                // Ядро — только в обычном режиме: флагам обновления проверки не нужны.
+                let data_dir = app.path().app_data_dir()?;
+                app.manage(monitor::Monitor::start(app.handle().clone(), data_dir));
                 // Окно создаём сами (в конфиге create: false), чтобы в режиме флагов его не было вовсе.
                 WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
                     .build()?;
