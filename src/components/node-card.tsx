@@ -57,7 +57,7 @@ export const NodeCard = memo(function NodeCard({ data, selected }: NodeProps<Car
       <div className="flex items-center gap-1.5">
         <StatePlaque tone={tone} className={far ? "h-7 gap-1.5 px-3 text-[17px] [&_svg]:size-[18px]" : undefined} />
         {view.undeclared && (
-          <span className={cn("truncate rounded-full border border-dashed border-foreground/40 px-1.5 text-foreground/70", far ? "px-2 text-[15px] leading-6" : "text-[10px] leading-4")} title="Найден сбором, в инвентаре не описан">
+          <span className={cn("truncate rounded-full border border-dashed border-foreground/40 px-1.5 text-foreground/70", far ? "shrink-0 text-[13px] leading-6" : "text-[10px] leading-4")} title="Найден сбором, в инвентаре не описан">
             не описан
           </span>
         )}
