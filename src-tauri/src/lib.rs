@@ -1,3 +1,4 @@
+mod adapter;
 mod collect;
 mod commands;
 mod engine;
@@ -60,6 +61,10 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                // Вкладки логов закрылись вместе с окном: `docker logs -f` на серверах не нужен.
+                if let Some(core) = window.try_state::<std::sync::Arc<monitor::Monitor>>() {
+                    core.close_all_logs();
+                }
             }
         })
         .setup(move |app| {

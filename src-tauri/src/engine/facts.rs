@@ -90,19 +90,19 @@ pub struct HostFacts {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // строит сборщик; до стыковки — только тесты
 pub struct Collected {
     /// Секция docker: Err — команда не удалась («узнать не удалось», а не «контейнеров
     /// нет»); Ok — полный список, включая остановленные (`docker ps -a`).
     pub containers: Result<Vec<Container>, String>,
     /// Секция proxmox (`qm list` + `pct list`), так же.
-    pub vms: Result<Vec<Vm>, String>,
+    pub vms: Result<Vec<Guest>, String>,
+    /// Секция wireguard: пиры — для подсказок у туннелей.
+    pub peers: Result<Vec<WgPeer>, String>,
     /// Проверки, у которых `откуда` — этот узел.
     pub checks: HashMap<CheckKey, CheckResult>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // строит сборщик; до стыковки — только тесты
+#[derive(Debug, Clone, PartialEq)]
 pub struct Container {
     pub name: String,
     /// Метки com.docker.compose.project / com.docker.compose.service.
@@ -111,13 +111,29 @@ pub struct Container {
     pub facts: ContainerFacts,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // строит сборщик; до стыковки — только тесты
-pub struct Vm {
-    /// Номер ВМ или LXC — то, что в инвентаре в поле `вм`.
-    pub id: u32,
+#[derive(Debug, Clone, PartialEq)]
+pub struct WgPeer {
+    pub interface: String,
+    pub public_key: String,
+    pub allowed_ips: Vec<String>,
+    /// По часам самого хоста; `None` — handshake не было ни разу.
+    pub handshake_age_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestKind {
+    Vm,
+    Lxc,
+}
+
+/// Гостевая система Proxmox: номера ВМ и LXC общие — это поле `вм` в инвентаре.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Guest {
+    pub vmid: u32,
+    pub name: String,
     /// Как отдаёт гипервизор: running | stopped | paused …
     pub status: String,
+    pub kind: GuestKind,
 }
 
 /// Отбрасывает ответы уже завершённого цикла: опоздавший ответ старого цикла не должен

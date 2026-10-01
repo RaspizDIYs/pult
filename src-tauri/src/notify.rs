@@ -7,8 +7,6 @@ use std::collections::{HashMap, HashSet};
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
 
-/// Первое состояние подтверждается не раньше второго цикла: в первом только измерили.
-const FIRST_CONFIRMED_CYCLE: u64 = 2;
 /// Больше стольких уведомлений за цикл — уже пачка: шлём одно сводное.
 const MAX_SEPARATE: usize = 3;
 
@@ -26,7 +24,9 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    pub fn on_cycle(&mut self, cycle: u64, inv: &Inventory, states: &HashMap<String, NodeState>) -> Vec<Alert> {
+    /// `ready` — первое состояние уже подтверждено (второй цикл проверок и второй сбор):
+    /// до этого всё, что лежит, ещё не новость, а будущая стартовая сводка.
+    pub fn on_cycle(&mut self, ready: bool, inv: &Inventory, states: &HashMap<String, NodeState>) -> Vec<Alert> {
         let line = |id: &str, s: &NodeState| {
             let title = inv.nodes.iter().find(|n| n.id == id).map_or(id, |n| n.title.as_str());
             format!("{title}: {}", s.fact)
@@ -40,7 +40,7 @@ impl Notifier {
 
         // При старте — одно сводное вместо пачки: всё, что уже лежит, — не новость.
         if !self.started {
-            if cycle < FIRST_CONFIRMED_CYCLE {
+            if !ready {
                 return Vec::new();
             }
             self.started = true;
@@ -115,6 +115,8 @@ mod tests {
             measured_at: None,
             since: None,
             since_cycle: 0,
+            last_measured: None,
+            since_measured: None,
         };
         (id.into(), s)
     }
@@ -129,10 +131,10 @@ mod tests {
                 st("панель", OwnStatus::Fail, confirmed, true, "контейнер остановлен, код 137"),
             ])
         };
-        assert!(n.on_cycle(1, &inv, &fail(false)).is_empty(), "в первом цикле ничего не подтверждено");
-        let start = n.on_cycle(2, &inv, &fail(true));
+        assert!(n.on_cycle(false, &inv, &fail(false)).is_empty(), "в первом цикле ничего не подтверждено");
+        let start = n.on_cycle(true, &inv, &fail(true));
         assert_eq!(start, [Alert { title: "Сломано: 1".into(), body: "Панель задач: контейнер остановлен, код 137".into() }]);
-        assert!(n.on_cycle(3, &inv, &fail(true)).is_empty(), "о том же не повторяем");
+        assert!(n.on_cycle(true, &inv, &fail(true)).is_empty(), "о том же не повторяем");
 
         let ok = |confirmed| {
             HashMap::from([
@@ -140,8 +142,8 @@ mod tests {
                 st("панель", OwnStatus::Ok, confirmed, false, "контейнер работает"),
             ])
         };
-        assert!(n.on_cycle(4, &inv, &ok(false)).is_empty(), "не подтверждено — молчим");
-        assert_eq!(n.on_cycle(5, &inv, &ok(true))[0].body, "Панель задач: контейнер работает");
+        assert!(n.on_cycle(true, &inv, &ok(false)).is_empty(), "не подтверждено — молчим");
+        assert_eq!(n.on_cycle(true, &inv, &ok(true))[0].body, "Панель задач: контейнер работает");
 
         // Отказ не корня — не уведомляем; отказ корня — уведомляем один раз.
         let child = HashMap::from([
@@ -149,7 +151,7 @@ mod tests {
             st("панель", OwnStatus::Fail, true, false, "GET /health: таймаут 5 с"),
         ]);
         assert_eq!(
-            n.on_cycle(6, &inv, &child),
+            n.on_cycle(true, &inv, &child),
             [Alert { title: "Сломалось".into(), body: "Хост: порт 22: таймаут 3 с".into() }]
         );
     }
@@ -158,6 +160,6 @@ mod tests {
     fn quiet_start_when_nothing_is_broken() {
         let mut n = Notifier::default();
         let ok = HashMap::from([st("хост", OwnStatus::Ok, true, false, "открыт")]);
-        assert!(n.on_cycle(2, &inv(), &ok).is_empty());
+        assert!(n.on_cycle(true, &inv(), &ok).is_empty());
     }
 }

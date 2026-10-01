@@ -36,24 +36,56 @@ pub async fn run_local(nodes: &[Node]) -> Vec<(CheckKey, CheckResult)> {
     out
 }
 
+/// Предел проверки: из инвентаря или по умолчанию, не больше MAX_TIMEOUT_MS. Общий для
+/// проверок с этой машины и с узла (`откуда`).
+pub fn limit_ms(check: &Check) -> u64 {
+    let default = match check.kind {
+        CheckKind::Tcp => TCP_TIMEOUT_MS,
+        CheckKind::Http => HTTP_TIMEOUT_MS,
+    };
+    check.timeout_ms.unwrap_or(default).min(MAX_TIMEOUT_MS)
+}
+
+pub fn codes(check: &Check) -> Vec<u16> {
+    check.expect.as_ref().map_or(vec![200], |c| c.list())
+}
+
+pub fn result_kind(check: &Check) -> ResultKind {
+    match check.kind {
+        CheckKind::Tcp => ResultKind::Tcp,
+        CheckKind::Http => ResultKind::Http,
+    }
+}
+
+pub fn port_of(addr: &str) -> &str {
+    addr.rsplit_once(':').map_or("", |(_, p)| p)
+}
+
+pub fn path_of(url: &str) -> String {
+    reqwest::Url::parse(url).map_or_else(|_| url.to_string(), |u| u.path().to_string())
+}
+
+/// Код ответа против `ожидать` — одинаково для проверок отсюда и с узла.
+pub fn http_verdict(path: &str, code: u16, codes: &[u16]) -> (bool, String) {
+    if codes.contains(&code) {
+        (true, format!("GET {path} → {code}"))
+    } else {
+        let want: Vec<String> = codes.iter().map(u16::to_string).collect();
+        (false, format!("GET {path} → {code}, ожидался {}", want.join(" или ")))
+    }
+}
+
 pub async fn run(check: &Check) -> CheckResult {
     let measured_at = now();
     let target = check.target();
-    let (kind, default_ms) = match check.kind {
-        CheckKind::Tcp => (ResultKind::Tcp, TCP_TIMEOUT_MS),
-        CheckKind::Http => (ResultKind::Http, HTTP_TIMEOUT_MS),
-    };
-    let limit = Duration::from_millis(check.timeout_ms.unwrap_or(default_ms).min(MAX_TIMEOUT_MS));
+    let limit = Duration::from_millis(limit_ms(check));
     let start = Instant::now();
     let (ok, fact, connected) = match check.kind {
         CheckKind::Tcp => tcp(&target, limit).await,
-        CheckKind::Http => {
-            let codes = check.expect.as_ref().map_or(vec![200], |c| c.list());
-            http(&target, &codes, limit).await
-        }
+        CheckKind::Http => http(&target, &codes(check), limit).await,
     };
     CheckResult {
-        kind,
+        kind: result_kind(check),
         target,
         from: None,
         ok: Some(ok),
@@ -69,7 +101,7 @@ fn secs(d: Duration) -> String {
 
 /// (успех, факт, соединение установлено — тогда время ответа осмысленно).
 async fn tcp(addr: &str, limit: Duration) -> (bool, String, bool) {
-    let (host, port) = addr.rsplit_once(':').unwrap_or((addr, ""));
+    let (host, port) = (addr.rsplit_once(':').map_or(addr, |(h, _)| h), port_of(addr));
     let attempt = async {
         // Имя разрешаем отдельно: «имя не разрешается» и «порт закрыт» — разные факты.
         let addrs: Vec<_> = match lookup_host(addr).await {
@@ -90,7 +122,7 @@ async fn tcp(addr: &str, limit: Duration) -> (bool, String, bool) {
 }
 
 async fn http(url: &str, codes: &[u16], limit: Duration) -> (bool, String, bool) {
-    let path = reqwest::Url::parse(url).map_or_else(|_| url.to_string(), |u| u.path().to_string());
+    let path = path_of(url);
     // updater ставит тот же провайдер; кто первый — неважно, второй вызов ничего не делает.
     let _ = rustls::crypto::ring::default_provider().install_default();
     // Свой клиент на каждую проверку: пул соединений не должен прятать упавший сервер.
@@ -105,13 +137,8 @@ async fn http(url: &str, codes: &[u16], limit: Duration) -> (bool, String, bool)
     };
     match client.get(url).send().await {
         Ok(resp) => {
-            let code = resp.status().as_u16();
-            if codes.contains(&code) {
-                (true, format!("GET {path} → {code}"), true)
-            } else {
-                let want: Vec<String> = codes.iter().map(u16::to_string).collect();
-                (false, format!("GET {path} → {code}, ожидался {}", want.join(" или ")), true)
-            }
+            let (ok, fact) = http_verdict(&path, resp.status().as_u16(), codes);
+            (ok, fact, true)
         }
         Err(e) if e.is_timeout() => (false, format!("GET {path}: нет ответа, таймаут {}", secs(limit)), false),
         Err(e) if chain(&e).any(|m| m.starts_with("dns error")) => {
@@ -161,10 +188,10 @@ pub mod tests {
             let (ok, fact, _) = tcp(&open.to_string(), Duration::from_secs(1)).await;
             assert!(ok, "{fact}");
             assert_eq!(fact, format!("порт {}: открыт", open.port()));
-            drop(listener);
-            let (ok, fact, _) = tcp(&open.to_string(), Duration::from_secs(1)).await;
+            // Закрытый порт — 1, а не только что освобождённый: его успевал занять соседний тест.
+            let (ok, fact, _) = tcp("127.0.0.1:1", Duration::from_secs(1)).await;
             assert!(!ok);
-            assert_eq!(fact, format!("порт {}: соединение отклонено", open.port()));
+            assert_eq!(fact, "порт 1: соединение отклонено");
         });
     }
 

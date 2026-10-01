@@ -1,6 +1,6 @@
 //! Откуда берётся инвентарь: каталог (часто git-клон), личный файл, принятый снимок.
 
-use super::{merge, parse, validate, Inventory, FILE_NAME};
+use super::{merge, parse, validate, validate_unique, Inventory, FILE_NAME};
 use crate::{engine::now, store, system};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -90,10 +90,17 @@ fn load(dir: &Path, personal: &Path) -> Result<Accepted, String> {
     let file = dir.join(FILE_NAME);
     let text = std::fs::read_to_string(&file).map_err(|e| format!("не читается {}: {e}", file.display()))?;
     let (mut inventory, mut warnings) = parse(&text).map_err(|e| format!("{FILE_NAME}: {e}"))?;
-    if let Ok(text) = std::fs::read_to_string(personal) {
-        let (mine, w) = parse(&text).map_err(|e| format!("{PERSONAL_FILE}: {e}"))?;
-        warnings.extend(w);
-        inventory = merge(inventory, mine, &mut warnings);
+    // Нет личного файла — норма; не читается — ошибка: иначе его узлы молча пропали бы с карты.
+    match std::fs::read_to_string(personal) {
+        Ok(text) => {
+            let (mine, w) = parse(&text).map_err(|e| format!("{PERSONAL_FILE}: {e}"))?;
+            // Внутри файла id уникальны до слияния: при слиянии второй узел молча заменил бы первый.
+            validate_unique(&mine).map_err(|e| format!("{PERSONAL_FILE}: {e}"))?;
+            warnings.extend(w);
+            inventory = merge(inventory, mine, &mut warnings);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("не читается {}: {e}", personal.display())),
     }
     validate(&inventory)?;
     Ok(Accepted { inventory, commit: commit(dir), loaded_at: now(), warnings })
@@ -205,6 +212,32 @@ mod tests {
         assert_eq!(state.error, None);
         assert!(state.accepted.as_ref().unwrap().warnings.is_empty(), "{:?}", state.warnings());
         assert!(state.inventory().nodes.len() >= 15);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// Находка ревью 6: нечитаемый личный файл считался отсутствующим — его узлы молча пропадали.
+    #[test]
+    fn unreadable_personal_file_is_an_error_not_absence() {
+        let catalog = temp_dir("personal-catalog");
+        let data = temp_dir("personal-data");
+        std::fs::write(catalog.join(FILE_NAME), "версия_схемы: 1\nузлы:\n  - {id: а, название: А, вид: хост}\n").unwrap();
+        std::fs::create_dir_all(data.join(PERSONAL_FILE)).unwrap(); // каталог вместо файла — не читается
+        let state = InventoryState::startup(&data, Some(&catalog));
+        assert!(state.error.as_deref().is_some_and(|e| e.contains(PERSONAL_FILE)), "{:?}", state.error);
+        let _ = std::fs::remove_dir_all(catalog);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// Находка ревью 7: дубль id внутри личного файла сливался до проверки и не ловился.
+    #[test]
+    fn duplicate_id_inside_personal_file_is_rejected() {
+        let catalog = temp_dir("dup-catalog");
+        let data = temp_dir("dup-data");
+        std::fs::write(catalog.join(FILE_NAME), "версия_схемы: 1\nузлы:\n  - {id: а, название: А, вид: хост}\n").unwrap();
+        std::fs::write(data.join(PERSONAL_FILE), "версия_схемы: 1\nузлы:\n  - {id: б, название: Б1, вид: сервис}\n  - {id: б, название: Б2, вид: сервис}\n").unwrap();
+        let state = InventoryState::startup(&data, Some(&catalog));
+        assert!(state.error.as_deref().is_some_and(|e| e.contains("«б» повторяется")), "{:?}", state.error);
+        let _ = std::fs::remove_dir_all(catalog);
         let _ = std::fs::remove_dir_all(data);
     }
 }

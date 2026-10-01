@@ -1,20 +1,22 @@
 //! Ядро приложения: состояние, расписание циклов, обновление инвентаря, события.
 
 use crate::commands::{
-    EnvCheck, HistoryEntry, InventoryInfo, NodeView, Settings, Snapshot, StatesEvent, EVENT_SNAPSHOT, EVENT_STATES,
+    EnvCheck, HistoryEntry, InventoryInfo, LogEnd, LogLines, NodeView, Settings, Snapshot, StatesEvent, EVENT_LOG,
+    EVENT_LOG_END, EVENT_SNAPSHOT, EVENT_STATES,
 };
-use crate::engine::facts::{CheckKey, CheckResult, CycleGate, Facts, HostFacts};
+use crate::engine::facts::{CheckKey, CheckResult, CycleGate, Facts};
 use crate::engine::{self, NodeState};
 use crate::inventory::{self, Inventory, InventoryState};
 use crate::notify::Notifier;
-use crate::{notify, probes, store, system, tray};
-use std::collections::HashMap;
+use crate::{adapter, collect, notify, probes, store, system, tray};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter};
 use time::OffsetDateTime;
-use tokio::sync::Notify;
+use tokio::sync::{oneshot, Notify};
 
 /// Шаг, с которым планировщик смотрит на часы. Короткий, чтобы сон машины
 /// замечался быстро, а внеочередная проверка не ждала.
@@ -22,12 +24,20 @@ const STEP: Duration = Duration::from_secs(5);
 /// Разрыв по настенным часам больше шага на столько — машина спала.
 const WAKE_GAP: Duration = Duration::from_secs(10);
 const PULL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Сбор по ssh — раз в минуту: дороже локальных проверок и нагружает серверы.
+const COLLECT_INTERVAL: Duration = Duration::from_secs(60);
+/// Строк логов в одном событии: хвост в сотни строк не должен уходить сотней событий.
+const LOG_BATCH: usize = 200;
 
 pub struct Monitor {
     app: AppHandle,
     data_dir: PathBuf,
     state: Mutex<State>,
     recheck: Notify,
+    collect_now: Notify,
+    /// Открытые потоки логов: закрытие отправителя — отмена.
+    logs: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    next_log: AtomicU64,
 }
 
 struct State {
@@ -42,6 +52,12 @@ struct State {
     notifier: Notifier,
     /// Что последний раз показано в трее; None — ещё ничего.
     tray_roots: Option<usize>,
+    /// Номер последнего начатого сбора и сколько завершено.
+    collect_cycle: u64,
+    collects_done: u64,
+    collect_gate: CycleGate,
+    /// Узлы последнего отправленного снимка: неописанные контейнеры приходят и уходят.
+    node_ids: Vec<String>,
 }
 
 impl Monitor {
@@ -54,9 +70,18 @@ impl Monitor {
         if let Err(e) = system::set_autostart(&app, state.settings.autostart) {
             log::warn!("{e}");
         }
-        let monitor = Arc::new(Self { app, data_dir, state: Mutex::new(state), recheck: Notify::new() });
+        let monitor = Arc::new(Self {
+            app,
+            data_dir,
+            state: Mutex::new(state),
+            recheck: Notify::new(),
+            collect_now: Notify::new(),
+            logs: Mutex::new(HashMap::new()),
+            next_log: AtomicU64::new(1),
+        });
         monitor.emit(EVENT_SNAPSHOT, monitor.snapshot());
         tauri::async_runtime::spawn(monitor.clone().schedule());
+        tauri::async_runtime::spawn(monitor.clone().collect_loop());
         tauri::async_runtime::spawn(monitor.clone().pull_loop());
         monitor
     }
@@ -72,7 +97,9 @@ impl Monitor {
 
     /// Без id — внеочередной полный цикл. С id — сразу локальные проверки одного узла,
     /// не дожидаясь цикла: человек нажал «проверить» и ждёт ответа про этот узел.
+    /// Сбор запускается в обоих случаях: контейнеры и проверки «откуда» знает только он.
     pub fn recheck(self: &Arc<Self>, id: Option<String>) {
+        self.collect_now.notify_one();
         match id {
             None => self.recheck.notify_one(),
             Some(id) => {
@@ -83,6 +110,9 @@ impl Monitor {
 
     async fn recheck_node(self: Arc<Self>, id: String) {
         let Some(node) = self.lock().inventory.inventory().nodes.into_iter().find(|n| n.id == id) else { return };
+        if node.checks.iter().all(|c| c.from.is_some()) {
+            return; // локальных проверок нет — ответит сбор
+        }
         let results = probes::run_local(std::slice::from_ref(&node)).await;
         let mut s = self.lock();
         // Пока шли проверки, карта могла смениться — тогда номера проверок уже о другом.
@@ -90,10 +120,63 @@ impl Monitor {
             return;
         }
         s.facts.record_local(results);
-        // Оценка в том же цикле: подтверждение по-прежнему только по циклам.
         let states = s.evaluate(&self.data_dir);
-        self.after_change(&mut s);
-        self.emit(EVENT_STATES, StatesEvent { cycle: s.cycle, states });
+        let cycle = s.cycle;
+        self.after_evaluate(&mut s, cycle, states);
+    }
+
+    /// Поток `docker logs` контейнера. Строки — событиями `pult://log`, конец — `pult://log-end`.
+    pub fn open_logs(self: &Arc<Self>, id: &str, tail: u32) -> Result<String, String> {
+        let (hops, container) = {
+            let s = self.lock();
+            adapter::log_target(&s.effective_inventory(), &s.facts, id)?
+        };
+        let ssh = system::find("ssh");
+        let stream = collect::stream_logs(ssh.as_deref(), &hops, &container, tail).map_err(|e| e.to_string())?;
+        let stream_id = format!("log-{}", self.next_log.fetch_add(1, Ordering::Relaxed));
+        let (cancel, cancelled) = oneshot::channel();
+        self.logs.lock().unwrap_or_else(|e| e.into_inner()).insert(stream_id.clone(), cancel);
+        tauri::async_runtime::spawn(self.clone().forward_logs(stream_id.clone(), stream, cancelled));
+        Ok(stream_id)
+    }
+
+    /// Неизвестный поток — не ошибка: он мог уже кончиться сам.
+    pub fn close_logs(&self, stream_id: &str) {
+        self.logs.lock().unwrap_or_else(|e| e.into_inner()).remove(stream_id);
+    }
+
+    /// Окно закрыли — вкладок логов больше нет, держать `docker logs -f` на серверах незачем.
+    pub fn close_all_logs(&self) {
+        self.logs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    async fn forward_logs(self: Arc<Self>, stream_id: String, stream: collect::LogStream, mut cancelled: oneshot::Receiver<()>) {
+        let collect::LogStream { mut lines, done } = stream;
+        loop {
+            let first = tokio::select! {
+                line = lines.recv() => line,
+                // Отправитель закрыт (close_logs) — отмена.
+                _ = &mut cancelled => None,
+            };
+            let Some(first) = first else { break };
+            let mut batch = vec![first];
+            while batch.len() < LOG_BATCH {
+                match lines.try_recv() {
+                    Ok(line) => batch.push(line),
+                    Err(_) => break,
+                }
+            }
+            self.emit(EVENT_LOG, LogLines { stream_id: stream_id.clone(), lines: batch });
+        }
+        // Бросить приёмник — сигнал сборщику: ssh получит EOF, `docker logs` на сервере погаснет.
+        drop(lines);
+        let error = match done.await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(e) => Some(e.to_string()),
+        };
+        self.close_logs(&stream_id);
+        self.emit(EVENT_LOG_END, LogEnd { stream_id, error });
     }
 
     pub fn history(&self, id: &str, limit: usize) -> Result<Vec<HistoryEntry>, String> {
@@ -136,6 +219,7 @@ impl Monitor {
         if map_changed {
             self.after_change(s);
             self.recheck.notify_one();
+            self.collect_now.notify_one();
         }
         self.emit(EVENT_SNAPSHOT, s.snapshot());
         true
@@ -160,6 +244,7 @@ impl Monitor {
             woke = SystemTime::now().duration_since(before).is_ok_and(|gap| gap > STEP + WAKE_GAP);
             if woke {
                 log::info!("машина просыпалась: все измерения устарели, внеочередной цикл");
+                self.collect_now.notify_one();
             }
         }
     }
@@ -168,16 +253,80 @@ impl Monitor {
         let (inv, cycle) = self.lock().begin_cycle(woke_at);
         let results = probes::run_local(&inv.nodes).await;
         let mut s = self.lock();
-        let Some(states) = s.finish_cycle(cycle, &inv, results, &self.data_dir) else { return };
-        let inv = s.inventory.inventory();
-        let st = &mut *s;
-        let alerts = st.notifier.on_cycle(cycle, &inv, &st.states);
-        // Выключенные уведомления не копятся: состояние уведомителя всё равно движется,
+        let Some(states) = s.finish_cycle(cycle, results, &self.data_dir) else { return };
+        self.after_evaluate(&mut s, cycle, states);
+    }
+
+    /// Сбор по ssh: цепочки параллельно, сборы друг за другом. Ответ каждой цепочки ложится
+    /// в факты сразу, как пришёл: медленный дом не задерживает данные с прода.
+    async fn collect_loop(self: Arc<Self>) {
+        loop {
+            self.collect_cycle().await;
+            let _ = tokio::time::timeout(COLLECT_INTERVAL, self.collect_now.notified()).await;
+        }
+    }
+
+    async fn collect_cycle(&self) {
+        let (inv, cycle) = {
+            let mut s = self.lock();
+            s.collect_cycle += 1;
+            (s.inventory.inventory(), s.collect_cycle)
+        };
+        let plans = adapter::plans(&inv);
+        if plans.is_empty() {
+            return;
+        }
+        let ssh = system::find("ssh");
+        let started = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for plan in plans {
+            let ssh = ssh.clone();
+            set.spawn(async move {
+                let result = collect::collect(ssh.as_deref(), &plan).await;
+                (plan, result)
+            });
+        }
+        while let Some(done) = set.join_next().await {
+            let Ok((plan, result)) = done else { continue };
+            let mut s = self.lock();
+            if !s.collect_gate.accepts(cycle) {
+                return; // сменился инвентарь — ответы о старой карте
+            }
+            let facts = adapter::host_facts(&inv, &plan, result, engine::now(), COLLECT_INTERVAL);
+            s.facts.hosts.extend(facts);
+        }
+        let mut s = self.lock();
+        if !s.collect_gate.accepts(cycle) {
+            return;
+        }
+        s.collect_gate.finish(cycle);
+        s.collects_done += 1;
+        let failed: Vec<&String> = s.facts.hosts.iter().filter(|(_, f)| f.result.is_err()).map(|(id, _)| id).collect();
+        log::info!("сбор {cycle}: {:.1} с, не удалось с {} из {} узлов", started.elapsed().as_secs_f64(), failed.len(), s.facts.hosts.len());
+        let states = s.evaluate(&self.data_dir);
+        let local_cycle = s.cycle;
+        self.after_evaluate(&mut s, local_cycle, states);
+    }
+
+    /// После каждой оценки по новым измерениям: уведомления, трей, событие.
+    fn after_evaluate(&self, s: &mut State, cycle: u64, states: Vec<NodeState>) {
+        let inv = s.effective_inventory();
+        // Сводка при старте — когда подтвердились и проверки, и сбор (если он есть).
+        let collects = inv.nodes.iter().any(|n| n.collect.is_some());
+        let ready = s.cycle >= 2 && (!collects || s.collects_done >= 2);
+        let alerts = s.notifier.on_cycle(ready, &inv, &s.states);
+        // Выключенные уведомления не копятся: уведомитель всё равно идёт за состоянием,
         // и включение не вывалит старое разом.
         if s.settings.notifications {
             notify::send(&self.app, alerts);
         }
-        self.after_change(&mut s);
+        self.after_change(s);
+        // Сбор нашёл или потерял неописанный контейнер — интерфейсу нужен новый список узлов.
+        let ids: Vec<String> = inv.nodes.iter().map(|n| n.id.clone()).collect();
+        if s.node_ids != ids {
+            s.node_ids = ids;
+            self.emit(EVENT_SNAPSHOT, s.snapshot());
+        }
         self.emit(EVENT_STATES, StatesEvent { cycle, states });
     }
 
@@ -226,6 +375,10 @@ impl State {
             taken_at: engine::now(),
             notifier: Notifier::default(),
             tray_roots: None,
+            collect_cycle: 0,
+            collects_done: 0,
+            collect_gate: CycleGate::default(),
+            node_ids: Vec::new(),
         };
         state.evaluate(data_dir);
         state
@@ -251,8 +404,11 @@ impl State {
             inv.nodes.iter().find(|n| &n.id == id).and_then(|n| n.checks.get(*i)).cloned()
         };
         self.facts.local.retain(|k, _| check(&before, k).is_some() && check(&before, k) == check(&after, k));
-        // Идущий цикл проверяет старую карту — его ответы отбросит шлюз.
+        // То же со сбором: факты узла остаются, только если его план не изменился.
+        self.facts.hosts.retain(|id, _| adapter::same_plan(&before, &after, id));
+        // Идущие цикл и сбор проверяют старую карту — их ответы отбросят шлюзы.
         self.gate.finish(self.cycle);
+        self.collect_gate.finish(self.collect_cycle);
         self.evaluate(data_dir);
         Some(true)
     }
@@ -267,32 +423,27 @@ impl State {
 
     /// Ответы цикла — в факты, затем оценка. None — цикл закрыт раньше (сменился
     /// инвентарь), ответы относятся к старой карте и отброшены.
-    fn finish_cycle(
-        &mut self,
-        cycle: u64,
-        inv: &Inventory,
-        results: Vec<(CheckKey, CheckResult)>,
-        data_dir: &Path,
-    ) -> Option<Vec<NodeState>> {
+    fn finish_cycle(&mut self, cycle: u64, results: Vec<(CheckKey, CheckResult)>, data_dir: &Path) -> Option<Vec<NodeState>> {
         if !self.gate.accepts(cycle) {
             return None;
         }
         self.facts.record_local(results);
         self.gate.finish(cycle);
-        let now = engine::now();
-        // ponytail: заглушка до стыковки со сборщиком (collect/): у каждого узла со «сбор»
-        // сбор «не удался», поэтому контейнеры и проверки «откуда» — unknown.
-        for n in inv.nodes.iter().filter(|n| n.collect.is_some()) {
-            let stub = HostFacts { measured_at: now, interval: probes::INTERVAL, result: Err("сбор ещё не подключён".into()) };
-            self.facts.hosts.insert(n.id.clone(), stub);
-        }
         Some(self.evaluate(data_dir))
+    }
+
+    /// Принятый инвентарь плюс неописанные контейнеры, которые увидел сбор.
+    fn effective_inventory(&self) -> Inventory {
+        let mut inv = self.inventory.inventory();
+        let extra = adapter::undeclared(&inv, &self.facts);
+        inv.nodes.extend(extra);
+        inv
     }
 
     /// Оценить, запомнить, дописать переходы в историю. Возвращает изменившиеся состояния.
     fn evaluate(&mut self, data_dir: &Path) -> Vec<NodeState> {
         let now = engine::now();
-        let inv = self.inventory.inventory();
+        let inv = self.effective_inventory();
         let new = engine::evaluate(&inv, &self.facts, &self.states, self.cycle, now);
         let changed: Vec<NodeState> = new.iter().filter(|n| self.states.get(&n.id) != Some(*n)).cloned().collect();
         // Первое состояние узла — не переход: иначе каждый запуск писал бы «неизвестно» всем.
@@ -314,8 +465,9 @@ impl State {
     }
 
     fn snapshot(&self) -> Snapshot {
-        let inv = self.inventory.inventory();
+        let inv = self.effective_inventory();
         let accepted = self.inventory.accepted.as_ref();
+        let declared: HashSet<&str> = accepted.iter().flat_map(|a| a.inventory.nodes.iter().map(|n| n.id.as_str())).collect();
         Snapshot {
             cycle: self.cycle,
             taken_at: self.taken_at,
@@ -326,7 +478,11 @@ impl State {
                 error: self.inventory.error.clone(),
                 warnings: self.inventory.warnings(),
             },
-            nodes: inv.nodes.iter().map(|n| NodeView::new(n, &inv)).collect(),
+            nodes: inv
+                .nodes
+                .iter()
+                .map(|n| NodeView { undeclared: !declared.contains(n.id.as_str()), ..NodeView::new(n, &inv) })
+                .collect(),
             states: self.states.clone(),
         }
     }
@@ -385,15 +541,15 @@ mod tests {
             .iter()
             .map(|n| ((n.id.clone(), 0), probes::tests::ok_result(&n.checks[0])))
             .collect();
-        state.finish_cycle(cycle, &inv, results, &data).unwrap();
+        state.finish_cycle(cycle, results, &data).unwrap();
 
         // Следующий цикл начался, и тут поменялась проверка узла «б».
-        let (old_inv, in_flight) = state.begin_cycle(None);
+        let (_, in_flight) = state.begin_cycle(None);
         std::fs::write(catalog.join(inventory::FILE_NAME), yaml(2)).unwrap();
         assert_eq!(state.reload(&data), Some(true));
         assert_eq!(state.states["а"].own, engine::OwnStatus::Ok, "проверка «а» не менялась");
         assert_eq!(state.states["б"].own, engine::OwnStatus::Unknown);
-        assert!(state.finish_cycle(in_flight, &old_inv, Vec::new(), &data).is_none(), "ответы старой карты отброшены");
+        assert!(state.finish_cycle(in_flight, Vec::new(), &data).is_none(), "ответы старой карты отброшены");
         let history = store::history(&data, "а", 10).unwrap();
         assert_eq!(history.len(), 1, "у «а» только переход в ok: {:?}", history.iter().map(|h| &h.fact).collect::<Vec<_>>());
 
@@ -415,7 +571,7 @@ mod tests {
         for _ in 0..2 {
             let (inv, cycle) = state.begin_cycle(None);
             let results = rt.block_on(probes::run_local(&inv.nodes));
-            state.finish_cycle(cycle, &inv, results, &data).unwrap();
+            state.finish_cycle(cycle, results, &data).unwrap();
         }
         let snapshot = state.snapshot();
         let mut ids: Vec<_> = snapshot.nodes.iter().map(|n| n.id.clone()).collect();

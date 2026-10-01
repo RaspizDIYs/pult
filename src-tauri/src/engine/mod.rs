@@ -4,8 +4,8 @@
 
 pub mod facts;
 
-use crate::inventory::{Expected, Inventory, Node};
-use facts::{CheckResult, Container, ContainerFacts, Facts, HostFacts, ResultKind, Vm};
+use crate::inventory::{Expected, Inventory, Node, NodeKind};
+use facts::{CheckResult, Container, ContainerFacts, Facts, Guest, HostFacts, ResultKind, WgPeer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -43,9 +43,15 @@ pub struct NodeState {
     pub measured_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub since: Option<OffsetDateTime>,
-    /// Цикл, с которого `own` не менялся: по нему считается `confirmed`.
+    /// Цикл, с которого `own` не менялся: по нему `confirmed` у узлов без измерений.
     #[serde(skip)]
     pub since_cycle: u64,
+    /// Самое свежее измерение узла и каким оно было, когда `own` сменился: подтверждает
+    /// только новое измерение, а не повторная оценка старых (сбор идёт реже проверок).
+    #[serde(skip)]
+    pub last_measured: Option<OffsetDateTime>,
+    #[serde(skip)]
+    pub since_measured: Option<OffsetDateTime>,
 }
 
 /// Оценка всех узлов в порядке инвентаря. `prev` — состояния прошлой оценки,
@@ -76,13 +82,18 @@ pub fn evaluate(
             Some(p) if p.own == s.own => {
                 s.since = p.since;
                 s.since_cycle = p.since_cycle;
+                s.since_measured = p.since_measured;
             }
             _ => {
                 s.since = Some(now);
                 s.since_cycle = cycle;
+                s.since_measured = s.last_measured;
             }
         }
-        s.confirmed = cycle > s.since_cycle;
+        s.confirmed = match s.last_measured {
+            Some(last) => s.since_measured.is_some_and(|since| last > since),
+            None => cycle > s.since_cycle,
+        };
     }
     states
 }
@@ -133,7 +144,7 @@ fn own_state(node: &Node, facts: &Facts, now: OffsetDateTime) -> NodeState {
             Some(from) => {
                 let Some(host) = facts.hosts.get(from) else { continue };
                 let unknown = |fact: String| CheckResult {
-                    kind: result_kind(check),
+                    kind: crate::probes::result_kind(check),
                     target: check.target(),
                     from: Some(from.clone()),
                     ok: None,
@@ -171,6 +182,9 @@ fn own_state(node: &Node, facts: &Facts, now: OffsetDateTime) -> NodeState {
     let stale = |r: &CheckResult, interval: Duration| {
         r.ok.is_some() && (facts.woke_at.is_some_and(|w| r.measured_at < w) || now - r.measured_at > interval * 3)
     };
+    if node.kind == NodeKind::Tunnel {
+        hints.extend(wireguard_hints(node, facts));
+    }
     let first = |want: fn(&CheckResult, bool) -> bool| {
         seen.iter().find(|(r, iv)| want(r, stale(r, *iv))).map(|(r, _)| r.fact.clone())
     };
@@ -190,6 +204,16 @@ fn own_state(node: &Node, facts: &Facts, now: OffsetDateTime) -> NodeState {
     } else {
         (OwnStatus::Unknown, "измерений ещё не было".to_string())
     };
+    // Известное в порядке, но не всё известно: неполнота должна быть видна, а не тонуть в зелёном.
+    if own == OwnStatus::Ok {
+        for (r, iv) in &seen {
+            if r.ok.is_none() {
+                hints.push(format!("часть данных не получена: {}", r.fact));
+            } else if stale(r, *iv) {
+                hints.push(format!("часть данных устарела: {}", r.fact));
+            }
+        }
+    }
 
     NodeState {
         id: node.id.clone(),
@@ -200,17 +224,12 @@ fn own_state(node: &Node, facts: &Facts, now: OffsetDateTime) -> NodeState {
         is_root: false,
         blocked_by: Vec::new(),
         measured_at: seen.iter().map(|(r, _)| r.measured_at).min(),
+        last_measured: seen.iter().filter(|(r, _)| r.ok.is_some()).map(|(r, _)| r.measured_at).max(),
+        since_measured: None,
         checks: seen.into_iter().map(|(r, _)| r).collect(),
         container,
         since: None,
         since_cycle: 0,
-    }
-}
-
-fn result_kind(check: &crate::inventory::Check) -> ResultKind {
-    match check.kind {
-        crate::inventory::CheckKind::Tcp => ResultKind::Tcp,
-        crate::inventory::CheckKind::Http => ResultKind::Http,
     }
 }
 
@@ -242,20 +261,25 @@ fn bound_fact(node: &Node, on: &str, host: &HostFacts) -> (CheckResult, Vec<Stri
 
 type Fact = (Option<bool>, String, Vec<String>, Option<ContainerFacts>);
 
+/// Этот ли контейнер описан узлом: по имени или по меткам compose.
+pub fn container_matches(node: &Node, c: &Container) -> bool {
+    match (&node.container, &node.compose) {
+        (Some(name), _) => &c.name == name,
+        (None, Some(cmp)) => {
+            c.compose_project.as_deref() == Some(cmp.project.as_str())
+                && c.compose_service.as_deref() == Some(cmp.service.as_str())
+        }
+        _ => false,
+    }
+}
+
 fn container_fact(node: &Node, list: &[Container]) -> Fact {
-    let matches: Vec<&Container> = list
-        .iter()
-        .filter(|c| match (&node.container, &node.compose) {
-            (Some(name), _) => &c.name == name,
-            (None, Some(cmp)) => {
-                c.compose_project.as_deref() == Some(cmp.project.as_str())
-                    && c.compose_service.as_deref() == Some(cmp.service.as_str())
-            }
-            _ => false,
-        })
-        .collect();
+    let matches: Vec<&Container> = list.iter().filter(|c| container_matches(node, c)).collect();
     // Несколько экземпляров сервиса compose — один узел: работает, если работает хоть один.
-    let Some(c) = matches.iter().find(|c| c.facts.state == "running").or(matches.first()) else {
+    // Сначала тот, что полностью исправен: иначе порядок в `docker ps` решал бы за нас.
+    let healthy = |c: &&&Container| c.facts.state == "running" && c.facts.health.as_deref() != Some("unhealthy");
+    let pick = matches.iter().find(healthy).or_else(|| matches.iter().find(|c| c.facts.state == "running"));
+    let Some(c) = pick.or(matches.first()) else {
         // Список полный (сбор удался), значит контейнера действительно нет.
         return match node.expected {
             Expected::Running => (Some(false), "контейнер не найден".into(), Vec::new(), None),
@@ -310,9 +334,9 @@ fn container_hints(f: &ContainerFacts) -> Vec<String> {
     hints
 }
 
-fn vm_fact(node: &Node, list: &[Vm]) -> Fact {
+fn vm_fact(node: &Node, list: &[Guest]) -> Fact {
     let id = node.vm.unwrap_or_default();
-    let Some(vm) = list.iter().find(|v| v.id == id) else {
+    let Some(vm) = list.iter().find(|v| v.vmid == id) else {
         return match node.expected {
             Expected::Running => (Some(false), format!("ВМ {id} не найдена"), Vec::new(), None),
             _ => (Some(true), format!("ВМ {id} нет, так и должно быть"), Vec::new(), None),
@@ -325,6 +349,52 @@ fn vm_fact(node: &Node, list: &[Vm]) -> Fact {
         (false, _) => format!("ВМ {id}: {}", vm.status),
     };
     (Some(running || node.expected != Expected::Running), fact, Vec::new(), None)
+}
+
+/// Пир WireGuard для адреса проверки туннеля: время последнего handshake — подсказка,
+/// почему туннель может молчать. Сопоставление — по allowed-ips пиров собранных хостов.
+fn wireguard_hints(node: &Node, facts: &Facts) -> Vec<String> {
+    let ips: Vec<std::net::Ipv4Addr> = node.checks.iter().filter_map(|c| check_ip(c)).collect();
+    let mut hints = Vec::new();
+    for (host, hf) in &facts.hosts {
+        let Ok(c) = &hf.result else { continue };
+        let Ok(peers) = &c.peers else { continue };
+        for ip in &ips {
+            let Some(peer) = peers.iter().find(|p: &&WgPeer| p.allowed_ips.iter().any(|net| in_net(*ip, net))) else { continue };
+            hints.push(match peer.handshake_age_secs {
+                None => format!("WireGuard на {host}: с пиром {ip} handshake не было ни разу"),
+                // Пир шлёт handshake раз в 2 минуты, пока есть трафик или keepalive.
+                Some(age) if age > 180 => format!("WireGuard на {host}: последний handshake с {ip} {} назад — пир, похоже, не на связи", human(age)),
+                Some(age) => format!("WireGuard на {host}: последний handshake с {ip} {} назад", human(age)),
+            });
+        }
+    }
+    hints.sort();
+    hints
+}
+
+fn check_ip(c: &crate::inventory::Check) -> Option<std::net::Ipv4Addr> {
+    let host = match (&c.address, &c.url) {
+        (Some(a), _) => a.rsplit_once(':')?.0.to_string(),
+        (None, Some(u)) => reqwest::Url::parse(u).ok()?.host_str()?.to_string(),
+        _ => return None,
+    };
+    host.parse().ok()
+}
+
+fn in_net(ip: std::net::Ipv4Addr, net: &str) -> bool {
+    let (addr, bits) = net.split_once('/').unwrap_or((net, "32"));
+    let (Ok(addr), Ok(bits)) = (addr.parse::<std::net::Ipv4Addr>(), bits.parse::<u32>()) else { return false };
+    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits.min(32)) };
+    u32::from(ip) & mask == u32::from(addr) & mask
+}
+
+fn human(secs: u64) -> String {
+    match secs {
+        0..=119 => format!("{secs} с"),
+        120..=7199 => format!("{} мин", secs / 60),
+        _ => format!("{} ч", secs / 3600),
+    }
 }
 
 #[cfg(test)]

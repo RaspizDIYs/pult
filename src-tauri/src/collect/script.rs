@@ -7,8 +7,11 @@ use super::{Collector, Hop, HostPlan, PlanError, RemoteCheck};
 const NESTED_LIMIT_SECS: u32 = 15;
 
 /// Общие функции, повторяются на каждом уровне цепочки (вложенный хост получает свой полный скрипт).
-/// - `pult_t` — предел времени, если на хосте есть `timeout`; проверяем запуском, а не `command -v`:
-///   у старого busybox другой синтаксис, и тогда лучше без предела, чем с ошибкой.
+/// - `pult_t` — предел времени: `timeout`, если на хосте есть совместимый (проверяем запуском, а не
+///   `command -v`: у старого busybox другой синтаксис), иначе свой сторож. Без предела вложенный ssh
+///   к зависшему хосту съел бы общие 45 секунд. Фоновой команде sh подменяет stdin на /dev/null,
+///   поэтому вход (скрипт вложенного хоста) передаётся явно через fd 4; сторож отвязан от всех
+///   каналов, иначе подстановка `$(…)` ждала бы и его. Сработавший сторож — код 124, как у `timeout`.
 /// - `pult_sec` — секция печатается одним `printf` уже после команды: код выхода известен только
 ///   в конце, а одна запись не перемешивается с параллельными проверками.
 /// - `docker ps` только перечисляет id: его `{{json .}}` отдаёт команду запуска, монтирования и все
@@ -18,10 +21,20 @@ const NESTED_LIMIT_SECS: u32 = 15;
 /// - Проверки отвечают кодом 0, если проба состоялась (итог — в строке `@tcp`/`@http`), и не нулём,
 ///   только если её нечем выполнить: «узнать не удалось» и «порт закрыт» — разные факты.
 /// - Вложенный ssh с `UpdateHostKeys=no`: иначе клиент на промежуточном хосте мог бы дописать его
-///   `known_hosts`, а сбор на серверах ничего не пишет.
+///   `known_hosts`, а сбор на серверах ничего не пишет. Keepalive — как у внешнего: оборванный
+///   канал замечается за 10 секунд, а не по пределу.
 const PRELUDE: &str = r#"pult_tm=
 timeout 1 true >/dev/null 2>&1 && pult_tm=1
-pult_t() { _l=$1; shift; if [ -n "$pult_tm" ]; then timeout "$_l" "$@"; else "$@"; fi; }
+pult_t() {
+  _l=$1; shift
+  if [ -n "$pult_tm" ]; then timeout "$_l" "$@"; return; fi
+  { "$@" <&4 4<&- & _p=$!
+    ( trap 'kill $! 2>/dev/null; exit 0' TERM; sleep "$_l" & wait $!; kill "$_p" 2>/dev/null ) </dev/null >/dev/null 2>&1 4<&- &
+    _w=$!
+    wait "$_p"; _r=$?
+    if kill "$_w" 2>/dev/null; then return $_r; fi
+    return 124; } 4<&0
+}
 pult_sec() {
   _h=$1; _s=$2; shift 2
   _o=$("$@" 2>&1); _r=$?
@@ -40,13 +53,18 @@ pult_proxmox() {
 }
 pult_tcp() {
   if command -v nc >/dev/null 2>&1; then
-    pult_t $(($3 + 1)) nc -v -z -w "$3" "$1" "$2"
-  elif command -v bash >/dev/null 2>&1; then
-    pult_t "$3" bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2"
-  else
-    echo 'нет ни nc, ни bash'; return 127
+    _n=$(pult_t $(($3 + 1)) nc -v -z -w "$3" "$1" "$2" 2>&1); _c=$?
+    # nc без -z отвечает справкой и кодом 1 — как закрытый порт. Это «нечем проверить», не отказ.
+    case $_n in
+      *[Uu]sage:*|*[Ii]nvalid\ option*|*[Ii]llegal\ option*|*[Uu]nrecognized\ option*) ;;
+      *) printf '%s\n' "$_n"; echo "@tcp $_c"; return 0 ;;
+    esac
   fi
-  echo "@tcp $?"
+  if command -v bash >/dev/null 2>&1; then
+    pult_t "$3" bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2"
+    echo "@tcp $?"; return 0
+  fi
+  echo 'нечем проверить порт: нет nc с -z и нет bash'; return 127
 }
 pult_http() {
   command -v curl >/dev/null 2>&1 || { echo 'нет curl'; return 127; }
@@ -55,7 +73,7 @@ pult_http() {
 }
 pult_ssh() {
   _h=$1; _l=$2; _g=$3; shift 3
-  { _e=$(pult_t "$_l" ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o UpdateHostKeys=no "$@" "$_g" sh -s 2>&1 1>&3 3>&-); _r=$?; } 3>&1
+  { _e=$(pult_t "$_l" ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o UpdateHostKeys=no "$@" "$_g" sh -s 2>&1 1>&3 3>&-); _r=$?; } 3>&1
   printf '@@pult 1 host=%s section=ssh rc=%s\n%s\n' "$_h" "$_r" "$_e"
 }
 "#;
@@ -136,7 +154,7 @@ pub(super) fn logs_script(hops: &[Hop], container: &str, tail: u32) -> Result<St
     for hop in hops[1..].iter().rev() {
         let key = hop.key.as_deref().map(|k| format!(" -i {}", quote(k)));
         script = format!(
-            "exec ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o UpdateHostKeys=no{} {} {}\n",
+            "exec ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o UpdateHostKeys=no{} {} {}\n",
             key.unwrap_or_default(),
             quote(&hop.target),
             quote(&format!("sh -c {}", quote(&script)))
@@ -176,14 +194,14 @@ fn check(owner: &str, what: &str, value: &str, ok: fn(&str) -> bool) -> Result<(
 
 /// Белый список контракта: буквы, цифры, `@ . _ - / ~ :`. Ведущий `-` запрещён отдельно:
 /// иначе значение стало бы опцией ssh или nc (`-oProxyCommand=…`, `-E файл`).
-fn is_plain(v: &str) -> bool {
+pub(crate) fn is_plain(v: &str) -> bool {
     !v.is_empty()
         && !v.starts_with('-')
         && v.chars().all(|c| c.is_alphanumeric() || "@._-/~:".contains(c))
 }
 
 /// Для url шире: запрос и `%`-кодирование. Только http(s): иначе curl прочитал бы `file://`.
-fn is_url(v: &str) -> bool {
+pub(crate) fn is_url(v: &str) -> bool {
     (v.starts_with("http://") || v.starts_with("https://"))
         && v.chars().all(|c| c.is_alphanumeric() || "@._-/~:?&=%+,".contains(c))
 }
@@ -285,5 +303,51 @@ mod tests {
                 assert!(child.wait().unwrap().success(), "{shell}:\n{script}");
             }
         }
+    }
+
+    /// Запуск куска скрипта под dash (или sh) с подделками в начале PATH.
+    #[cfg(unix)]
+    fn run_sh(body: &str, stubs: &[(&str, &str)]) -> (String, std::time::Duration) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pult-sh-{}-{}", std::process::id(), stubs.first().map_or("none", |s| s.0)));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in stubs {
+            std::fs::write(dir.join(name), text).unwrap();
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shell = ["/bin/dash", "/usr/bin/dash"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap_or("/bin/sh");
+        let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+        let started = std::time::Instant::now();
+        let out = std::process::Command::new(shell).arg("-c").arg(format!("{PRELUDE}\n{body}")).env("PATH", path).output().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (String::from_utf8_lossy(&out.stdout).into_owned(), started.elapsed())
+    }
+
+    /// Находка ревью 2: без совместимого `timeout` предел не действовал вовсе.
+    #[cfg(unix)]
+    #[test]
+    fn limit_holds_without_timeout_and_nested_ssh_has_keepalive() {
+        let (out, took) = run_sh("pult_t 1 sleep 4; echo \"rc=$?\"", &[("timeout", "#!/bin/sh\nexit 1\n")]);
+        assert!(took < std::time::Duration::from_secs(3), "предел не сработал: {took:?}");
+        assert!(out.contains("rc=124"), "{out}");
+        let mut p = host("хост-а", "user@10.0.0.2");
+        p.nested = vec![host("хост-б", "user@10.0.0.4")];
+        let s = build_script(&p).unwrap();
+        let line = s.lines().find(|l| l.contains("ssh -T") && l.contains("UpdateHostKeys")).unwrap();
+        assert!(line.contains("ServerAliveInterval=5") && line.contains("ServerAliveCountMax=2"), "{line}");
+    }
+
+    /// Находка ревью 4: nc без `-z` давал «@tcp 1» — ложный «порт закрыт».
+    #[cfg(unix)]
+    #[test]
+    fn nc_without_z_is_not_a_closed_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fake_nc = "#!/bin/sh\necho 'usage: nc [-46DdhklnrStUuv] [-i interval] [-p source_port]' >&2\nexit 1\n";
+        let (out, _) = run_sh(&format!("pult_tcp 127.0.0.1 {port} 2; echo \"rc=$?\""), &[("nc", fake_nc)]);
+        // Либо запасной путь установил соединение, либо проба честно не состоялась (код ≠ 0).
+        assert!(out.contains("@tcp 0") || !out.contains("rc=0"), "{out}");
+        drop(listener);
     }
 }

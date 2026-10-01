@@ -123,10 +123,10 @@ fn outcome<T>(section: Option<&Section>, parse: fn(&[&str]) -> Result<T, String>
 struct Inspect {
     name: String,
     state: String,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
     oom_killed: Option<bool>,
     health: Option<String>,
-    restart_count: Option<u32>,
+    restart_count: Option<u64>,
     started_at: Option<String>,
     finished_at: Option<String>,
     image: Option<String>,
@@ -138,9 +138,14 @@ fn parse_docker(lines: &[&str]) -> Result<Vec<Container>, String> {
     lines
         .iter()
         .map(|l| l.trim())
-        // Строки не-JSON — предупреждения docker в stderr, он слит с выводом.
-        .filter(|l| l.starts_with('{'))
+        // stderr слит с выводом: предупреждения docker («WARNING: …») — известные строки.
+        // Любая другая непонятная строка — «узнать не удалось»: молча выброшенная, она дала бы
+        // неполный или пустой список, а это для движка «контейнера нет».
+        .filter(|l| !l.is_empty() && !l.starts_with("WARNING:"))
         .map(|line| {
+            if !line.starts_with('{') {
+                return Err(format!("непонятная строка в ответе docker: {line:?}"));
+            }
             let i: Inspect = serde_json::from_str(line)
                 .map_err(|e| format!("не разобран ответ docker inspect: {e}"))?;
             Ok(Container {
@@ -167,8 +172,13 @@ fn non_empty(v: Option<String>) -> Option<String> {
 }
 
 /// docker пишет нулевое время Go, если контейнер ни разу не запускался или ещё не остановлен.
+/// Наносекунды срезаем до секунд, как во всех временах снимка: дробь из девяти знаков
+/// не всякий движок JS разберёт.
 fn timestamp(v: Option<String>) -> Option<String> {
-    v.filter(|t| !t.is_empty() && !t.starts_with("0001-"))
+    use time::format_description::well_known::Rfc3339;
+    let t = v.filter(|t| !t.is_empty() && !t.starts_with("0001-"))?;
+    let parsed = time::OffsetDateTime::parse(&t, &Rfc3339).ok().and_then(|d| d.replace_nanosecond(0).ok());
+    Some(parsed.and_then(|d| d.format(&Rfc3339).ok()).unwrap_or(t))
 }
 
 /// Первая строка — время хоста, потом `latest-handshakes`, после `@ips` — `allowed-ips`.
@@ -213,6 +223,10 @@ fn parse_wireguard(lines: &[&str]) -> Result<Vec<WgPeer>, String> {
 /// `qm list`: VMID NAME STATUS MEM BOOTDISK PID — имя может быть с пробелом, поэтому
 /// статус берём четвёртым с конца. `pct list`: VMID Status [Lock] Name — Lock бывает пустым.
 fn parse_proxmox(lines: &[&str]) -> Result<Vec<Guest>, String> {
+    // Без обеих частей список неполный: отсутствие ВМ в нём ничего не доказывает.
+    if !(lines.iter().any(|l| l.trim() == "@qm") && lines.iter().any(|l| l.trim() == "@pct")) {
+        return Err("proxmox: в ответе нет частей @qm и @pct".into());
+    }
     let mut kind = None;
     let mut guests = Vec::new();
     for line in lines {
@@ -352,7 +366,7 @@ mod tests {
         assert_eq!((cache.exit_code, cache.oom_killed, cache.restart_count), (Some(137), Some(true), Some(5)));
         // Нулевое время Go — «не было», а не 1 января первого года.
         assert_eq!(by_name(&reports[0], "app-backend-1").finished_at, None);
-        assert_eq!(by_name(&reports[0], "app-db").finished_at.as_deref(), Some("2026-01-01T08:59:58.1Z"));
+        assert_eq!(by_name(&reports[0], "app-db").finished_at.as_deref(), Some("2026-01-01T08:59:58Z"));
     }
 
     #[test]
@@ -486,5 +500,17 @@ mod tests {
         let broken = CHAIN.replace(r#"{"name":"/cache""#, r#"{"name":"/cache"#);
         let reports = parse_output(&plan(), &broken);
         assert!(matches!(&reports[0].docker, Some(Outcome::Failed { rc: 0, .. })));
+    }
+
+    /// Находка ревью 3: непонятные строки давали пустой список — «контейнеров нет».
+    #[test]
+    fn unparsed_lines_are_section_errors_not_empty_lists() {
+        assert!(parse_docker(&["что-то непонятное"]).is_err());
+        let json = r#"{"name":"/a","state":"running","exitCode":0,"oomKilled":false,"health":null,"restartCount":0,"startedAt":"","finishedAt":"","image":"x","project":"","service":""}"#;
+        // Предупреждения docker — известные строки, список при них верен.
+        assert_eq!(parse_docker(&["WARNING: No swap limit support", json]).unwrap().len(), 1);
+        assert!(parse_proxmox(&["@qm"]).is_err(), "нет части @pct");
+        assert!(parse_proxmox(&[]).is_err());
+        assert_eq!(parse_proxmox(&["@qm", "      VMID NAME STATUS MEM(MB) BOOTDISK(GB) PID", "@pct", "VMID Status Lock Name"]).unwrap(), vec![]);
     }
 }

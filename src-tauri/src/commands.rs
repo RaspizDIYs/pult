@@ -12,6 +12,8 @@ use time::OffsetDateTime;
 
 pub const EVENT_SNAPSHOT: &str = "pult://snapshot";
 pub const EVENT_STATES: &str = "pult://states";
+pub const EVENT_LOG: &str = "pult://log";
+pub const EVENT_LOG_END: &str = "pult://log-end";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,6 +134,20 @@ pub struct LogStream {
     pub stream_id: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogLines {
+    pub stream_id: String,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEnd {
+    pub stream_id: String,
+    pub error: Option<String>,
+}
+
 type Core<'a> = State<'a, Arc<Monitor>>;
 
 #[tauri::command]
@@ -178,16 +194,15 @@ pub fn check_environment(core: Core<'_>) -> Vec<EnvCheck> {
     core.check_environment()
 }
 
-const LOGS_LATER: &str = "логи контейнеров появятся вместе со сбором по ssh";
-
+/// Асинхронная: поток логов запускается задачами tokio, а синхронные команды идут
+/// на главном потоке, вне рантайма.
 #[tauri::command]
-pub fn open_logs(id: String, tail: Option<u32>) -> Result<LogStream, String> {
-    let _ = (id, tail);
-    Err(LOGS_LATER.into())
+pub async fn open_logs(core: Core<'_>, id: String, tail: Option<u32>) -> Result<LogStream, String> {
+    let stream_id = core.open_logs(&id, tail.unwrap_or(200).min(5000))?;
+    Ok(LogStream { stream_id })
 }
 
 #[tauri::command]
-pub fn close_logs(stream_id: String) -> Result<(), String> {
-    let _ = stream_id;
-    Err(LOGS_LATER.into())
+pub fn close_logs(core: Core<'_>, stream_id: String) {
+    core.close_logs(&stream_id);
 }

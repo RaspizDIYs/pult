@@ -221,6 +221,18 @@ pub fn merge(mut base: Inventory, personal: Inventory, warnings: &mut Vec<String
     base
 }
 
+/// Уникальность id внутри одного файла — до слияния, пока дубли ещё видны.
+pub fn validate_unique(inv: &Inventory) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    let dups: Vec<String> = inv
+        .nodes
+        .iter()
+        .filter(|n| !seen.insert(n.id.as_str()))
+        .map(|n| format!("id «{}» повторяется", n.id))
+        .collect();
+    if dups.is_empty() { Ok(()) } else { Err(dups.join("\n")) }
+}
+
 /// Полная проверка по правилам контракта. Любая ошибка отклоняет снимок целиком,
 /// поэтому собираем все сразу: чинить по одной за перезапуск утомительно.
 pub fn validate(inv: &Inventory) -> Result<(), String> {
@@ -278,6 +290,15 @@ pub fn validate(inv: &Inventory) -> Result<(), String> {
             }
             if let Some(from) = &ch.from {
                 need_node(&mut errors, &at, "откуда", from, true);
+                // Проверка уйдёт в скрипт сбора: недопустимое значение сорвало бы сбор всей
+                // цепочки, поэтому ловим его здесь, по тому же белому списку.
+                let ok = match ch.kind {
+                    CheckKind::Tcp => ch.address.as_deref().and_then(|a| a.rsplit_once(':')).is_some_and(|(h, _)| crate::collect::is_plain(h)),
+                    CheckKind::Http => ch.url.as_deref().is_some_and(crate::collect::is_url),
+                };
+                if !ok {
+                    errors.push(format!("{at}: адрес для проверки на узле содержит недопустимые символы"));
+                }
             }
         }
     }
@@ -296,11 +317,9 @@ pub fn validate(inv: &Inventory) -> Result<(), String> {
 
 /// Значения `ssh` и `ключ` уходят аргументами в ssh: белый список символов не даёт
 /// подставить из инвентаря команду, а запрет ведущего «-» — опцию вроде `-F` или `-o`.
+/// Список тот же, что у сборщика: расхождение отклонило бы план уже при сборе.
 fn safe_arg(errors: &mut Vec<String>, id: &str, field: &str, value: &str) {
-    let ok = !value.is_empty()
-        && !value.starts_with('-')
-        && value.chars().all(|c| c.is_alphanumeric() || "@._-/~:".contains(c));
-    if !ok {
+    if !crate::collect::is_plain(value) {
         errors.push(format!(
             "{id}: «{field}» содержит недопустимые символы (можно буквы, цифры и @ . _ - / ~ :, не с «-»)"
         ));

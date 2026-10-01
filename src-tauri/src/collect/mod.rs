@@ -1,19 +1,17 @@
 //! Сбор фактов по ssh: план → скрипт POSIX sh → один сеанс ssh на цепочку → разобранные факты.
 //! Контракт: docs/контракт.md, раздел 4. Типы инвентаря сюда не тянем намеренно:
-//! план строит адаптер на стороне движка.
-
-// Движок подключит модуль следующим шагом; до тех пор публичное API никем не вызывается.
-#![allow(dead_code, unused_imports)]
+//! план строит адаптер (`crate::adapter`); факты о контейнерах — сразу типы движка.
 
 mod parse;
 mod run;
 mod script;
 
-pub use parse::parse_output;
-pub use run::{collect, stream_logs, LogStream, COLLECT_LIMIT};
-pub use script::build_script;
+pub use run::{collect, stream_logs, LogStream};
+pub(crate) use script::{is_plain, is_url};
 
-use serde::Serialize;
+/// Контейнеры, пиры и гостевые системы — те же типы, что читает движок: второй копии
+/// с другими числами нет, адаптеру нечего переводить.
+pub use crate::engine::facts::{Container, ContainerFacts, Guest, GuestKind, WgPeer};
 
 /// Встроенные сборщики. Произвольных команд нет: инвентарь не должен быть источником кода.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,52 +81,6 @@ pub struct HostReport {
     pub proxmox: Option<Outcome<Vec<Guest>>>,
     /// В порядке `HostPlan::checks`.
     pub checks: Vec<Outcome<ProbeResult>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Container {
-    pub name: String,
-    pub compose_project: Option<String>,
-    pub compose_service: Option<String>,
-    pub facts: ContainerFacts,
-}
-
-/// Тип из контракта (раздел 2), уходит в интерфейс как есть.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ContainerFacts {
-    pub state: String,
-    pub exit_code: Option<i32>,
-    pub oom_killed: Option<bool>,
-    pub health: Option<String>,
-    pub restart_count: Option<u32>,
-    pub started_at: Option<String>,
-    pub finished_at: Option<String>,
-    pub image: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WgPeer {
-    pub interface: String,
-    pub public_key: String,
-    pub allowed_ips: Vec<String>,
-    /// По часам самого хоста; `None` — handshake не было ни разу.
-    pub handshake_age_secs: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuestKind {
-    Vm,
-    Lxc,
-}
-
-/// Гостевая система Proxmox: номера ВМ и LXC общие.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Guest {
-    pub vmid: u32,
-    pub name: String,
-    pub status: String,
-    pub kind: GuestKind,
 }
 
 /// Результат удалённой tcp/http-проверки. Успех по списку ожидаемых кодов решает движок.

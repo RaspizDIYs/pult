@@ -11,7 +11,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::script::{build_script, logs_script};
-use super::{parse_output, Hop, HostPlan, HostReport, Outcome, PlanError};
+use super::parse::parse_output;
+use super::{Hop, HostPlan, HostReport, Outcome, PlanError};
 
 /// Общий предел цикла сбора (контракт, раздел 4).
 pub const COLLECT_LIMIT: Duration = Duration::from_secs(45);
@@ -98,7 +99,7 @@ async fn run_bounded(mut cmd: Command, input: String, limit: Duration) -> RunOut
     let err_task = tokio::spawn(pump(child.stderr.take().expect("piped"), err.clone(), MAX_STDERR));
     // Отдельной задачей: если сервер не читает вход, запись не должна держать предел времени.
     // После записи stdin закрывается — для `sh -s` это конец скрипта.
-    tokio::spawn(async move {
+    let in_task = tokio::spawn(async move {
         let _ = stdin.write_all(input.as_bytes()).await;
     });
     let rc = match tokio::time::timeout(limit, child.wait()).await {
@@ -110,11 +111,20 @@ async fn run_bounded(mut cmd: Command, input: String, limit: Duration) -> RunOut
             124
         }
     };
-    for task in [out_task, err_task] {
-        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    for task in [out_task, err_task, in_task] {
+        stop(task, Duration::from_secs(2)).await;
     }
     let take = |buf: &Arc<Mutex<Vec<u8>>>| std::mem::take(&mut *buf.lock().unwrap());
     RunOutput { stdout: take(&out), stderr: take(&err), rc }
+}
+
+/// Дождаться задачи, а не дождались — отменить и дождаться отмены. Брошенный `JoinHandle`
+/// задачу не отменяет: она продолжала бы держать канал, в который пишет потомок ssh.
+async fn stop(mut task: JoinHandle<()>, grace: Duration) {
+    if tokio::time::timeout(grace, &mut task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 /// Читает поток до конца, но хранит не больше `cap` байт: остальное вычитывается и теряется,
@@ -192,7 +202,7 @@ async fn follow(mut cmd: Command, script: String, tx: mpsc::Sender<String>) -> R
             None
         }
     };
-    let _ = tokio::time::timeout(Duration::from_secs(1), err_task).await;
+    stop(err_task, Duration::from_secs(1)).await;
     if tx.is_closed() || status.is_some_and(|s| s.success()) {
         return Ok(());
     }
@@ -223,6 +233,8 @@ case $target in
   *down*) echo "ssh: connect to host $target port 22: Connection timed out" >&2; exit 255 ;;
   *slow*) printf '@@pult 1 host=slow section=wireguard rc=0\n100\n@ips\n@@pult 1 host=slow section=docker rc=0\n{"name":'
           exec sleep 30 ;;
+  # ssh уже вышел, а потомок (как мастер ControlPersist) держит его stdout и пишет в него.
+  *persist*) ( while :; do echo x; sleep 0.1; done ) & echo $! > "$(dirname "$0")/persist.pid"; exit 0 ;;
 esac
 exec sh -c "$*"
 "#;
@@ -339,6 +351,21 @@ esac
         assert!(stream.lines.recv().await.unwrap().contains("No such container"));
         assert_eq!(stream.lines.recv().await, None);
         assert!(stream.done.await.unwrap().is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Находка ревью 1: после предела задачи чтения бросались, но жили дальше и держали
+    /// дескрипторы — потомок ssh продолжал писать в никуда, а мы — читать.
+    #[tokio::test]
+    async fn readers_are_stopped_when_ssh_exits_but_stdout_stays_open() {
+        let dir = stubs("persist");
+        let p = plan("хост", "persist-host");
+        let _ = collect_within(Some(&dir.join("ssh")), &p, Duration::from_secs(2)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let pid = std::fs::read_to_string(dir.join("persist.pid")).unwrap().trim().to_owned();
+        let alive = std::process::Command::new("kill").args(["-0", &pid]).status().unwrap().success();
+        let _ = std::process::Command::new("kill").arg(&pid).status();
+        assert!(!alive, "наш конец канала ещё открыт: писатель жив");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

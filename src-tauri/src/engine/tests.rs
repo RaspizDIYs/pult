@@ -58,7 +58,7 @@ fn container(name: &str, state: &str, exit_code: Option<i64>, oom: Option<bool>)
 }
 
 fn collected(containers: Vec<Container>) -> Result<Collected, String> {
-    Ok(Collected { containers: Ok(containers), vms: Err("не собиралось".into()), checks: HashMap::new() })
+    Ok(Collected { containers: Ok(containers), vms: Err("не собиралось".into()), peers: Err("не собиралось".into()), checks: HashMap::new() })
 }
 
 fn eval(inv: &Inventory, facts: &Facts) -> HashMap<String, NodeState> {
@@ -123,7 +123,7 @@ fn failed_collection_makes_containers_unknown_not_fail() {
     // Отказ одной секции сбора — тоже «узнать не удалось».
     f.hosts.insert(
         "хост-а".into(),
-        host(Ok(Collected { containers: Err("rc=1".into()), vms: Err("не собиралось".into()), checks: HashMap::new() })),
+        host(Ok(Collected { containers: Err("rc=1".into()), vms: Err("не собиралось".into()), peers: Err("не собиралось".into()), checks: HashMap::new() })),
     );
     let s = eval(&inv, &f);
     assert_eq!(s["хост-а"].own, OwnStatus::Ok);
@@ -251,8 +251,67 @@ fn remote_check_comes_from_its_host_collection() {
 
     let mut checks = HashMap::new();
     checks.insert(("туннель".to_string(), 0), result(Some(false), "порт 22: таймаут 3 с", NOW));
-    f.hosts.insert("хост-а".into(), host(Ok(Collected { containers: Ok(vec![]), vms: Ok(vec![]), checks })));
+    f.hosts.insert("хост-а".into(), host(Ok(Collected { containers: Ok(vec![]), vms: Ok(vec![]), peers: Ok(vec![]), checks })));
     let s = eval(&inv, &f);
     assert_eq!(s["туннель"].own, OwnStatus::Fail);
     assert!(s["туннель"].is_root);
+}
+
+/// Находка ревью 5: у compose-сервиса из двух экземпляров исход зависел от порядка в docker ps.
+#[test]
+fn compose_service_is_ok_when_any_instance_fully_healthy() {
+    let inv = inv(r#"
+  - {id: хост-а, название: А, вид: хост, сбор: {ssh: host-a, что: [docker]}}
+  - {id: api, название: API, вид: контейнер, на: хост-а, compose: {проект: app, сервис: backend}}
+"#);
+    let instance = |name: &str, health: &str| {
+        let mut c = container(name, "running", None, None);
+        c.compose_project = Some("app".into());
+        c.compose_service = Some("backend".into());
+        c.facts.health = Some(health.into());
+        c
+    };
+    for order in [["unhealthy", "healthy"], ["healthy", "unhealthy"]] {
+        let mut f = facts(&[]);
+        f.hosts.insert("хост-а".into(), host(collected(vec![instance("app-backend-1", order[0]), instance("app-backend-2", order[1])])));
+        assert_eq!(eval(&inv, &f)["api"].own, OwnStatus::Ok, "{order:?}");
+    }
+}
+
+/// Правило ревью 8: свежий ok при недополученной части данных — ok, но неполнота видна.
+#[test]
+fn partial_ok_shows_what_is_missing_and_fresh_fail_still_wins() {
+    let inv = inv(r#"
+  - {id: хост-а, название: А, вид: хост, проверки: [{вид: tcp, адрес: "a.example.com:22"}], сбор: {ssh: host-a, что: [docker]}}
+"#);
+    let mut f = facts(&[("хост-а", Some(true), "порт 22: открыт")]);
+    f.hosts.insert("хост-а".into(), host(Err("ssh: таймаут 8 с".into())));
+    let s = &eval(&inv, &f)["хост-а"];
+    assert_eq!(s.own, OwnStatus::Ok);
+    assert_eq!(s.hints, ["часть данных не получена: сбор не удался: ssh: таймаут 8 с"]);
+    assert!(s.checks.iter().any(|c| c.ok.is_none()), "строка с ok: null в checks");
+
+    let mut f = facts(&[("хост-а", Some(false), "порт 22: таймаут 3 с")]);
+    f.hosts.insert("хост-а".into(), host(collected(vec![])));
+    assert_eq!(eval(&inv, &f)["хост-а"].own, OwnStatus::Fail, "свежий отказ любого измерения — fail");
+}
+
+/// Подтверждение — только новым измерением: сбор раз в минуту, а оценка — после каждой
+/// локальной проверки, и одно старое измерение не должно подтверждать само себя.
+#[test]
+fn reevaluating_old_collection_does_not_confirm() {
+    let inv = inv(r#"
+  - {id: хост-а, название: А, вид: хост, сбор: {ssh: host-a, что: [docker]}}
+  - {id: база, название: База, вид: контейнер, на: хост-а, контейнер: db}
+"#);
+    let mut f = facts(&[]);
+    f.hosts.insert("хост-а".into(), host(collected(vec![container("db", "exited", Some(1), None)])));
+    let first: HashMap<_, _> = evaluate(&inv, &f, &HashMap::new(), 1, NOW).into_iter().map(|s| (s.id.clone(), s)).collect();
+    let again: HashMap<_, _> = evaluate(&inv, &f, &first, 2, NOW + Duration::from_secs(30)).into_iter().map(|s| (s.id.clone(), s)).collect();
+    assert!(!again["база"].confirmed, "тот же сбор, другой цикл — не подтверждение");
+    let mut next = host(collected(vec![container("db", "exited", Some(1), None)]));
+    next.measured_at = NOW + Duration::from_secs(60);
+    f.hosts.insert("хост-а".into(), next);
+    let third = evaluate(&inv, &f, &again, 3, NOW + Duration::from_secs(60));
+    assert!(third.iter().find(|s| s.id == "база").unwrap().confirmed, "новый сбор с тем же итогом — подтверждение");
 }
