@@ -1,0 +1,135 @@
+name: release
+
+# Порядок: черновик релиза → сборки под мак и винду → одна задача собирает latest.json
+# и публикует. Пока обе платформы не собрались, релиз остаётся черновиком, и
+# releases/latest/download/latest.json продолжает указывать на прошлую версию.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+      notes: ${{ steps.draft.outputs.notes }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Тег совпадает с версией в package.json
+        run: |
+          v=$(node -p "require('./package.json').version")
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "::error::тег $GITHUB_REF_NAME, а в package.json $v"; exit 1; }
+      - name: Черновик релиза
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # checkout подменяет аннотированный тег лёгким, а текст изменений лежит в аннотации.
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          notes=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$GITHUB_REF_NAME" \
+            -f name="Pult $GITHUB_REF_NAME" -f body="$notes" -F draft=true --jq .id)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          { echo 'notes<<NOTES_EOF'; echo "$notes"; echo 'NOTES_EOF'; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            args: --target universal-apple-darwin --bundles app,dmg
+          - os: windows-latest
+            args: --bundles nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Ключ подписи обновлений на месте
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        # Без ключа сборка прошла бы, но без .sig — и обновление молча не выйдет.
+        run: '[ -n "$KEY" ] && [ -n "$PASSWORD" ] || { echo "::error::нет секретов TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)"; exit 1; }'
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.id }}
+          releaseDraft: true
+          # latest.json собирает задача publish: параллельные сборки перетирают записи друг друга.
+          uploadUpdaterJson: false
+          args: ${{ matrix.args }} --config src-tauri/tauri.ci-updater.json
+
+  publish:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ID: ${{ needs.create-release.outputs.id }}
+      NOTES: ${{ needs.create-release.outputs.notes }}
+    steps:
+      - name: Собрать и проверить latest.json
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          tag=$GITHUB_REF_NAME
+          ver=${tag#v}
+          gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets?per_page=100" > assets.json
+
+          # Запись платформы: ровно один файл обновления этой версии и его подпись из того же релиза.
+          entry() {
+            local name sig_id sig
+            name=$(jq -er --arg s "$1" --arg v "_${ver}_" \
+              '[.[] | select((.name | endswith($s)) and (.name | contains($v)))]
+               | if length == 1 then .[0].name else error("файлов *\($s) версии \($v): \(length)") end' assets.json)
+            sig_id=$(jq -er --arg n "$name.sig" '.[] | select(.name == $n) | .id' assets.json) \
+              || { echo "::error::нет подписи $name.sig" >&2; return 1; }
+            sig=$(gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$sig_id")
+            [ -n "$sig" ] || { echo "::error::пустая подпись $name.sig" >&2; return 1; }
+            jq -n --arg sig "$sig" --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/$name" \
+              '{signature: $sig, url: $url}'
+          }
+          mac=$(entry .app.tar.gz)
+          win=$(entry -setup.exe)
+
+          jq -n --arg v "$ver" --arg notes "$NOTES" --argjson mac "$mac" --argjson win "$win" \
+            '{version: $v, notes: $notes, pub_date: (now | todate),
+              platforms: {"darwin-aarch64": $mac, "darwin-x86_64": $mac, "windows-x86_64": $win}}' > latest.json
+          cat latest.json
+          for p in darwin-aarch64 darwin-x86_64 windows-x86_64; do
+            jq -e --arg p "$p" '.platforms[$p] | (.signature | length > 0) and (.url | length > 0)' latest.json > /dev/null
+          done
+
+          old=$(jq -r '.[] | select(.name == "latest.json") | .id' assets.json)
+          [ -z "$old" ] || gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+          gh api -X POST -H 'Content-Type: application/json' --input latest.json \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$ID/assets?name=latest.json" > /dev/null
+      - name: Опубликовать
+        run: gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -F draft=false -f make_latest=true > /dev/null
+      - name: Фид и файлы скачиваются без авторизации
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json" -o feed.json
+          [ "$(jq -r .version feed.json)" = "${GITHUB_REF_NAME#v}" ]
+          for url in $(jq -r '.platforms[].url' feed.json | sort -u); do
+            curl -fsSL -r 0-0 -o /dev/null "$url" && echo "ok $url"
+          done

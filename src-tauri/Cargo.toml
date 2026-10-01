@@ -1,0 +1,27 @@
+[package]
+name = "pult"
+# Версия приложения живёт в package.json; эта — только версия крейта, её не трогаем.
+version = "0.0.0"
+description = "Пульт — карта хостов и сервисов RaspizDIYs"
+authors = ["RaspizDIYs"]
+edition = "2021"
+
+[lib]
+# Имя с _lib, чтобы не столкнуться с бинарником pult в Windows (см. шаблон Tauri).
+name = "pult_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+# Нужен макросу generate_context! для конфигов плагинов.
+serde_json = "1"
+# Закреплено точно: поведение установки обновлений меняется между версиями плагина.
+tauri-plugin-updater = "=2.13.1"
+tauri-plugin-process = "2"
+tauri-plugin-log = "2"
+
+[profile.release]
+strip = true
