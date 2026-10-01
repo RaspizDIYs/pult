@@ -28,7 +28,8 @@ serde_yaml = "0.9"
 serde_ignored = "0.1"
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 log = "0.4"
-tokio = { version = "1", features = ["net", "time", "process", "sync", "rt", "io-util"] }
+# macros — для tokio::select! и #[tokio::test] в модуле сбора.
+tokio = { version = "1", features = ["net", "time", "process", "sync", "rt", "io-util", "macros"] }
 # Те же reqwest и rustls, что уже тянет updater: новых крейтов для http-проверок не нужно.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

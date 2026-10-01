@@ -1,3 +1,4 @@
+mod collect;
 mod commands;
 mod engine;
 mod inventory;

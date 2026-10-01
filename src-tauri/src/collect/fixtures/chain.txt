@@ -1,0 +1,55 @@
+Welcome to Example Linux 24.04 LTS
+
+ * Documentation:  https://help.example.com
+Last login: Thu Jan  1 00:00:00 2026 from 10.0.0.100
+@@pult 1 host=хост-а section=docker rc=0
+{"name":"/app-backend-1","state":"running","exitCode":0,"oomKilled":false,"health":"healthy","restartCount":0,"startedAt":"2026-01-01T10:00:00.123456789Z","finishedAt":"0001-01-01T00:00:00Z","image":"example/backend:1.4","project":"app","service":"backend"}
+{"name":"/app-backend-2","state":"running","exitCode":0,"oomKilled":false,"health":"starting","restartCount":0,"startedAt":"2026-01-01T10:05:00.123456789Z","finishedAt":"0001-01-01T00:00:00Z","image":"example/backend:1.5","project":"app","service":"backend"}
+{"name":"/app-db","state":"running","exitCode":0,"oomKilled":false,"health":"healthy","restartCount":2,"startedAt":"2026-01-01T09:00:00.5Z","finishedAt":"2026-01-01T08:59:58.1Z","image":"postgres:16","project":"app","service":"db"}
+{"name":"/worker","state":"exited","exitCode":137,"oomKilled":false,"health":null,"restartCount":0,"startedAt":"2026-01-01T09:00:00Z","finishedAt":"2026-01-01T11:30:00Z","image":"example/worker:2","project":"","service":""}
+{"name":"/cache","state":"exited","exitCode":137,"oomKilled":true,"health":null,"restartCount":5,"startedAt":"2026-01-01T09:00:00Z","finishedAt":"2026-01-01T11:31:00Z","image":"redis:7","project":"app","service":"cache"}
+{"name":"/app-migrator-1","state":"exited","exitCode":0,"oomKilled":false,"health":null,"restartCount":0,"startedAt":"2026-01-01T09:58:00Z","finishedAt":"2026-01-01T09:59:00Z","image":"example/backend:1.5","project":"app","service":"migrator"}
+@@pult 1 host=хост-а section=wireguard rc=0
+1767225600
+wg0	ZmFrZS13aXJlZ3VhcmQtcGVlci1rZXktb25lLTEyMzQ=	1767225540
+wg0	ZmFrZS13aXJlZ3VhcmQtcGVlci1rZXktdHdvLTU2Nzg=	0
+@ips
+wg0	ZmFrZS13aXJlZ3VhcmQtcGVlci1rZXktb25lLTEyMzQ=	10.0.0.2/32
+wg0	ZmFrZS13aXJlZ3VhcmQtcGVlci1rZXktdHdvLTU2Nzg=	10.0.0.3/32 192.168.50.0/24
+
+@@pult 1 host=хост-а section=check.2 rc=0
+@http 200 0.126063 0
+
+@@pult 1 host=хост-а section=check.0 rc=0
+Connection to 10.0.0.2 22 port [tcp/ssh] succeeded!
+@tcp 0
+
+@@pult 1 host=хост-а section=check.3 rc=0
+@http 000 5.001234 28
+
+@@pult 1 host=хост-а section=check.1 rc=0
+nc: connect to 10.0.0.9 port 9000 (tcp) failed: Connection refused
+@tcp 1
+
+@@pult 1 host=хост-б section=proxmox rc=0
+@qm
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID       
+       100 vm-a                 running    8192              60.00 1976      
+@pct
+VMID       Status     Lock         Name                
+101        running                 ct-mail             
+102        stopped    backup       ct-old              
+
+@@pult 1 host=хост-б section=docker rc=1
+permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.47/containers/json": dial unix /var/run/docker.sock: connect: permission denied
+
+@@pult 1 host=хост-б section=end rc=0
+
+@@pult 1 host=хост-б section=ssh rc=0
+
+
+@@pult 1 host=хост-в section=ssh rc=255
+ssh: connect to host 10.0.0.4 port 22: Connection timed out
+
+@@pult 1 host=хост-а section=end rc=0
+
