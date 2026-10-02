@@ -6,7 +6,7 @@ mod parse;
 mod run;
 mod script;
 
-pub use run::{collect, stream_logs, LogStream};
+pub use run::{collect, collect_within, stream_logs, LogStream};
 pub(crate) use script::{is_plain, is_url};
 
 /// Контейнеры, пиры и гостевые системы — те же типы, что читает движок: второй копии
@@ -35,6 +35,11 @@ pub struct Hop {
 pub enum RemoteCheck {
     Tcp { host: String, port: u16, timeout_ms: u32 },
     Http { url: String, timeout_ms: u32 },
+    /// `GET /api/tags` и `/api/ps` сервера Ollama. Тела ответов возвращаются как есть
+    /// (`ProbeResult::bodies`): разбирает их тот же код, что и ответы с этой машины.
+    Ollama { url: String, timeout_ms: u32 },
+    /// Одна настоящая генерация — кнопка «Спросить модель». В планы цикла не попадает.
+    OllamaAsk { url: String, model: String, timeout_ms: u32 },
 }
 
 /// Хост цепочки. Корень плана — внешний хост, `nested` выполняются с него (`через:`).
@@ -83,13 +88,16 @@ pub struct HostReport {
     pub checks: Vec<Outcome<ProbeResult>>,
 }
 
-/// Результат удалённой tcp/http-проверки. Успех по списку ожидаемых кодов решает движок.
-#[derive(Debug, Clone, PartialEq)]
+/// Результат удалённой проверки. Успех по списку ожидаемых кодов решает движок.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProbeResult {
-    /// tcp: соединение установлено; http: получен ответ.
+    /// tcp: соединение установлено; http и ollama: получен ответ.
     pub connected: bool,
     pub http_code: Option<u16>,
     pub latency_ms: Option<u64>,
     /// Наблюдаемый факт для карточки: «HTTP 502», «соединение отклонено».
     pub fact: String,
+    /// Только у ollama: тела ответов (`/api/tags`, затем `/api/ps`, если получен; у вопроса
+    /// модели — ответ `/api/generate`), ограниченные по размеру.
+    pub bodies: Vec<String>,
 }

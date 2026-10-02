@@ -153,6 +153,7 @@ fn own_state(node: &Node, facts: &Facts, now: OffsetDateTime) -> NodeState {
                     fact,
                     latency_ms: None,
                     measured_at: host.measured_at,
+                    models: Vec::new(),
                 };
                 let r = match &host.result {
                     Err(e) => unknown(format!("нет данных с {from}: {e}")),
@@ -176,6 +177,7 @@ fn own_state(node: &Node, facts: &Facts, now: OffsetDateTime) -> NodeState {
             fact,
             latency_ms: None,
             measured_at: host.measured_at,
+            models: Vec::new(),
         };
         seen.push((r, host.interval));
     }
@@ -257,6 +259,7 @@ fn bound_fact(node: &Node, on: &str, host: &HostFacts) -> (CheckResult, Vec<Stri
         fact,
         latency_ms: None,
         measured_at: host.measured_at,
+        models: Vec::new(),
     };
     (r, hints, facts)
 }

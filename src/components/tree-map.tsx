@@ -13,7 +13,7 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { ChevronRight, ChevronsDownUp, Folder, Globe, Maximize } from "lucide-react";
+import { ChevronRight, ChevronsDownUp, Folder, Globe, Laptop, Maximize } from "lucide-react";
 import { createContext, memo, useCallback, useContext, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { cardText, dependentsOf, kindInfo, TONE, toneOf, type Graph, type Tone } from "@/lib/model";
@@ -22,6 +22,7 @@ import {
   ancestorsOf,
   buildTree,
   layoutTree,
+  LOCAL_KEY,
   NET_KEY,
   PAD,
   ROW_H,
@@ -423,7 +424,7 @@ function MapView({ nodes, states, graph, selectedId, revealToken, onSelect }: Pr
             zoomOnDoubleClick={false}
             colorMode="system"
             ariaLabelConfig={ARIA_RU}
-            aria-label="Карта: площадки, их машины, проекты и сервисы"
+            aria-label="Карта: эта машина, площадки, их машины, проекты и сервисы"
           >
             <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} className="opacity-60" />
             <Controls showInteractive={false} position="bottom-left" />
@@ -446,8 +447,8 @@ function ItemView({ data }: NodeProps<ItemNode>) {
   const a = useContext(ActionsCtx)!;
   const { item, card, tone, line, hint, branch, open, focus, tab, confirmed } = data;
   const t = TONE[tone];
-  const KindIcon = item.node ? kindInfo(item.node.kind).Icon : item.key === NET_KEY ? Globe : Folder;
-  const kind = item.node ? kindInfo(item.node.kind).label : item.key === NET_KEY ? "Площадка" : "Папка проекта";
+  const KindIcon = item.node ? kindInfo(item.node.kind).Icon : item.key === NET_KEY ? Globe : item.key === LOCAL_KEY ? Laptop : Folder;
+  const kind = item.node ? kindInfo(item.node.kind).label : item.parent === null ? "Площадка" : "Папка";
   const selected = focus === "self";
 
   return (

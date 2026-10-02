@@ -1,5 +1,7 @@
-//! Проверки с машины пользователя: tcp и http. Проверки с `откуда` выполняет сбор на
+//! Проверки с машины пользователя: tcp, http и ollama. Проверки с `откуда` выполняет сбор на
 //! узле, здесь их нет.
+
+pub mod ollama;
 
 use crate::engine::facts::{CheckKey, CheckResult, ResultKind};
 use crate::engine::now;
@@ -41,7 +43,7 @@ pub async fn run_local(nodes: &[Node]) -> Vec<(CheckKey, CheckResult)> {
 pub fn limit_ms(check: &Check) -> u64 {
     let default = match check.kind {
         CheckKind::Tcp => TCP_TIMEOUT_MS,
-        CheckKind::Http => HTTP_TIMEOUT_MS,
+        CheckKind::Http | CheckKind::Ollama => HTTP_TIMEOUT_MS,
     };
     check.timeout_ms.unwrap_or(default).min(MAX_TIMEOUT_MS)
 }
@@ -54,6 +56,7 @@ pub fn result_kind(check: &Check) -> ResultKind {
     match check.kind {
         CheckKind::Tcp => ResultKind::Tcp,
         CheckKind::Http => ResultKind::Http,
+        CheckKind::Ollama => ResultKind::Ollama,
     }
 }
 
@@ -80,19 +83,22 @@ pub async fn run(check: &Check) -> CheckResult {
     let target = check.target();
     let limit = Duration::from_millis(limit_ms(check));
     let start = Instant::now();
-    let (ok, fact, connected) = match check.kind {
-        CheckKind::Tcp => tcp(&target, limit).await,
-        CheckKind::Http => http(&target, &codes(check), limit).await,
+    let mut models = Vec::new();
+    let (ok, fact, latency_ms) = match check.kind {
+        CheckKind::Tcp | CheckKind::Http => {
+            let (ok, fact, connected) = match check.kind {
+                CheckKind::Tcp => tcp(&target, limit).await,
+                _ => http(&target, &codes(check), limit).await,
+            };
+            (ok, fact, connected.then(|| start.elapsed().as_millis() as u64))
+        }
+        CheckKind::Ollama => {
+            let v = ollama::check(&target, &check.expect_models, limit).await;
+            models = v.models;
+            (v.ok, v.fact, v.latency_ms)
+        }
     };
-    CheckResult {
-        kind: result_kind(check),
-        target,
-        from: None,
-        ok: Some(ok),
-        fact,
-        latency_ms: connected.then(|| start.elapsed().as_millis() as u64),
-        measured_at,
-    }
+    CheckResult { kind: result_kind(check), target, from: None, ok: Some(ok), fact, latency_ms, measured_at, models }
 }
 
 fn secs(d: Duration) -> String {
@@ -100,7 +106,7 @@ fn secs(d: Duration) -> String {
 }
 
 /// (успех, факт, соединение установлено — тогда время ответа осмысленно).
-async fn tcp(addr: &str, limit: Duration) -> (bool, String, bool) {
+pub(crate) async fn tcp(addr: &str, limit: Duration) -> (bool, String, bool) {
     let (host, port) = (addr.rsplit_once(':').map_or(addr, |(h, _)| h), port_of(addr));
     let attempt = async {
         // Имя разрешаем отдельно: «имя не разрешается» и «порт закрыт» — разные факты.
@@ -123,29 +129,41 @@ async fn tcp(addr: &str, limit: Duration) -> (bool, String, bool) {
 
 async fn http(url: &str, codes: &[u16], limit: Duration) -> (bool, String, bool) {
     let path = path_of(url);
-    // updater ставит тот же провайдер; кто первый — неважно, второй вызов ничего не делает.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    // Свой клиент на каждую проверку: пул соединений не должен прятать упавший сервер.
-    // Редиректы не следуем: проверяется ответ этого адреса, нужный код пишется в `ожидать`.
-    let client = match reqwest::Client::builder()
-        .timeout(limit)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+    let client = match client(limit) {
         Ok(c) => c,
-        Err(e) => return (false, format!("GET {path}: {}", innermost(&e)), false),
+        Err(e) => return (false, format!("GET {path}: {e}"), false),
     };
     match client.get(url).send().await {
         Ok(resp) => {
             let (ok, fact) = http_verdict(&path, resp.status().as_u16(), codes);
             (ok, fact, true)
         }
-        Err(e) if e.is_timeout() => (false, format!("GET {path}: нет ответа, таймаут {}", secs(limit)), false),
-        Err(e) if chain(&e).any(|m| m.starts_with("dns error")) => {
-            let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
-            (false, format!("имя {host} не разрешается"), false)
-        }
-        Err(e) => (false, format!("GET {path}: {}", innermost(&e)), false),
+        Err(e) if chain(&e).any(|m| m.starts_with("dns error")) => (false, net_error(&e, url, limit), false),
+        Err(e) => (false, format!("GET {path}: {}", net_error(&e, url, limit)), false),
+    }
+}
+
+/// Свой клиент на каждую проверку: пул соединений не должен прятать упавший сервер.
+/// Редиректы не следуем: проверяется ответ этого адреса, нужный код пишется в `ожидать`.
+pub(crate) fn client(limit: Duration) -> Result<reqwest::Client, String> {
+    // updater ставит тот же провайдер; кто первый — неважно, второй вызов ничего не делает.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .timeout(limit)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| innermost(&e))
+}
+
+/// Почему запрос не дошёл — словами, одинаково для http, ollama и MCP по http.
+pub(crate) fn net_error(e: &reqwest::Error, url: &str, limit: Duration) -> String {
+    if e.is_timeout() {
+        format!("нет ответа, таймаут {}", secs(limit))
+    } else if chain(e).any(|m| m.starts_with("dns error")) {
+        let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
+        format!("имя {host} не разрешается")
+    } else {
+        innermost(e)
     }
 }
 
@@ -173,6 +191,7 @@ pub mod tests {
             fact: "открыт".into(),
             latency_ms: Some(1),
             measured_at: now(),
+            models: Vec::new(),
         }
     }
 

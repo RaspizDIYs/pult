@@ -25,6 +25,10 @@ pub struct CheckResult {
     pub latency_ms: Option<u64>,
     #[serde(with = "time::serde::rfc3339")]
     pub measured_at: OffsetDateTime,
+    /// Только у `ollama`: модели сервера. Из этого списка интерфейс даёт выбрать модель для
+    /// «Спросить модель», и по нему же ядро проверяет имя, пришедшее от интерфейса.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -35,6 +39,11 @@ pub enum ResultKind {
     Container,
     Vm,
     Collect,
+    Ollama,
+    /// MCP-сервер: настоящая проверка по кнопке (`initialize` + `tools/list`).
+    Mcp,
+    /// MCP-сервер stdio: есть ли сейчас его процесс.
+    Process,
 }
 
 /// Только эти поля берутся из `docker inspect`; окружение не читается вовсе.

@@ -9,7 +9,11 @@
 //   ok | containers | host | tunnel | mixed   — шаг сценария (по умолчанию шаги сменяются сами);
 //   no-inventory | empty | inventory-error | loading — экраны без карты и с ошибкой инвентаря.
 //
-// На карте три площадки (два хоста и гипервизор с ВМ) и «Сеть и внешнее», сервисы разложены
+// Первая площадка — «Эта машина» с папкой MCP: серверы во всех состояниях (запущен, не запущен,
+// адрес доступен и нет, отказ настоящей проверки); кнопка «Проверить по-настоящему» отвечает
+// через полторы секунды. У «Локальной модели» на хосте Г — проверка ollama и «Спросить модель».
+//
+// Дальше три площадки (два хоста и гипервизор с ВМ) и «Сеть и внешнее», сервисы разложены
 // по проектам; заглушка на хосте А скрыта (`скрыть: true`) — её проверяют, но не показывают;
 // в шаге containers корень отказа лежит глубоко: гипервизор → хост Б → «Задачи» → панель.
 import type {
@@ -18,8 +22,11 @@ import type {
   ContainerFacts,
   EnvCheck,
   HistoryEntry,
+  McpInfo,
+  McpProbe,
   NodeState,
   NodeView,
+  OllamaAnswer,
   Settings,
   Snapshot,
 } from "./pult";
@@ -27,12 +34,13 @@ import type {
 // ───────────── Описание выдуманной инфраструктуры ─────────────
 
 interface Probe {
-  kind: "tcp" | "http";
+  kind: "tcp" | "http" | "ollama";
   target: string;
   from?: string;
   ms: number;
   ok: string;
   down: string;
+  models?: string[];
 }
 
 const tcp = (host: string, port: number, ms = 20, from?: string): Probe => ({
@@ -48,6 +56,17 @@ const http = (url: string, ms = 60, from?: string): Probe => {
   const path = new URL(url).pathname;
   return { kind: "http", target: url, from, ms, ok: `GET ${path} → 200`, down: `GET ${path}: нет ответа, таймаут 5 с` };
 };
+
+const OLLAMA_MODELS = ["qwen3:8b", "llama3.2:3b", "nomic-embed-text:latest"];
+const ollama = (url: string, ms: number, from?: string): Probe => ({
+  kind: "ollama",
+  target: url,
+  from,
+  ms,
+  ok: `отвечает за ${ms} мс · моделей: ${OLLAMA_MODELS.length} · в памяти: qwen3:8b (GPU)`,
+  down: "не отвечает: соединение отклонено",
+  models: OLLAMA_MODELS,
+});
 
 interface Def {
   id: string;
@@ -119,7 +138,7 @@ const DEFS: Def[] = [
   { id: "статистика", title: "Статистика", kind: "сервис", group: "дом", project: "Мониторинг", on: "хост-б", dependsOn: ["панель"], probes: [tcp("10.0.0.2", 9100, 15, "хост-а")] },
   { id: "медиа", title: "Медиасервер", kind: "контейнер", group: "дом", project: "Медиа", on: "хост-г", container: "media" },
   { id: "загрузчик", title: "Загрузчик", kind: "контейнер", group: "дом", project: "Медиа", on: "хост-г", container: "fetcher" },
-  { id: "ollama", title: "Локальная модель", kind: "сервис", group: "дом", project: "ИИ", on: "хост-г", probes: [http("http://10.0.0.4:11434/api/tags", 120, "хост-а")] },
+  { id: "ollama", title: "Локальная модель", kind: "сервис", group: "дом", project: "ИИ", on: "хост-г", probes: [ollama("http://10.0.0.4:11434", 40, "хост-а")] },
 ];
 
 const byId = new Map(DEFS.map((d) => [d.id, d]));
@@ -236,7 +255,7 @@ function checksFor(def: Def, how: "ok" | "down" | "blocked", at: number, overrid
   const host = def.on ? titleOf(def.on) : "родителя";
   (def.probes ?? []).forEach((p, i) => {
     const base = { kind: p.kind, target: p.target, from: p.from ?? null, measuredAt: iso } as const;
-    if (how === "ok") res.push({ ...base, ok: true, fact: p.ok, latencyMs: jitter(p.ms) });
+    if (how === "ok") res.push({ ...base, ok: true, fact: p.ok, latencyMs: jitter(p.ms), ...(p.models && { models: p.models }) });
     else if (how === "blocked" && p.from)
       res.push({ ...base, ok: null, fact: `выполнить не удалось: узел «${titleOf(p.from)}» недоступен`, latencyMs: null });
     else res.push({ ...base, ok: false, fact: i === 0 && override ? override : p.down, latencyMs: null });
@@ -266,6 +285,7 @@ function okFact(def: Def, idx: number): string {
   if (def.container) return def.expected ? "остановлен, код 0 — так и ожидается" : `работает ${upText(40 + idx * 9)}`;
   if (def.kind === "вм") return "ВМ запущена, сбор docker идёт";
   const p = def.probes?.[0];
+  if (p?.kind === "ollama") return p.ok;
   return p ? `${p.ok}, ${p.ms} мс` : "—";
 }
 
@@ -318,7 +338,7 @@ function evaluate(faults: Record<string, Fault>, at: number): Record<string, Nod
       }
     } else if (!def.probes?.length && !def.collect && !hasContainer && def.kind !== "вм") {
       s.own = "unchecked";
-      s.fact = "у узла нет проверок";
+      s.fact = "не проверяется";
     } else {
       s.fact = okFact(def, idx);
       s.checks = checksFor(def, "ok", at);
@@ -327,6 +347,115 @@ function evaluate(faults: Record<string, Fault>, at: number): Record<string, Nod
     out[def.id] = s;
   });
   return out;
+}
+
+// ───────────── Эта машина: MCP-серверы ─────────────
+// Как в ядре, эти узлы идут мимо движка: состояние задано прямо. Имена и пути выдуманы.
+
+const NOT_RUNNING = "сейчас не запущен: стартует вместе с сессией Claude";
+const STDIO: McpInfo = { transport: "stdio", sources: ["~/.mcp.json"], command: "node", script: null, host: null, envNames: [], headerNames: [] };
+const REMOTE: McpInfo = { transport: "http", sources: ["~/work/shop/.mcp.json"], command: null, script: null, host: null, envNames: [], headerNames: [] };
+
+interface McpDef {
+  name: string;
+  info: McpInfo;
+  /** Что видно пассивно: запущен ли процесс или открыт ли порт. */
+  seen: { ok: boolean | null; fact: string };
+  /** Итог настоящей проверки: что уже есть при открытии и что ответит кнопка. */
+  real?: McpProbe;
+  onProbe: McpProbe;
+}
+
+const BROKEN: McpProbe = { ok: false, fact: "процесс завершился с кодом 1, не ответив на initialize; stderr: Error: Cannot find module '/home/alice/tools/archive-mcp/dist/index.js'" };
+const MCP_DEFS: McpDef[] = [
+  {
+    name: "вики",
+    info: { ...STDIO, sources: ["Claude Code: все проекты", "Claude Desktop"], command: "python", script: "~/tools/wiki-mcp/server.py", envNames: ["WIKI_URL", "WIKI_TOKEN"] },
+    seen: { ok: true, fact: "запущен, процессов: 2" },
+    onProbe: { ok: true, fact: "отвечает · инструментов: 6" },
+  },
+  {
+    name: "поиск",
+    info: { ...STDIO, command: "uvx", envNames: ["SEARCH_API_KEY"] },
+    seen: { ok: null, fact: NOT_RUNNING },
+    onProbe: { ok: true, fact: "отвечает · инструментов: 3" },
+  },
+  {
+    name: "трекер",
+    info: { ...REMOTE, host: "https://mcp.example.com", headerNames: ["Authorization"] },
+    seen: { ok: true, fact: "порт 443: открыт" },
+    onProbe: { ok: true, fact: "отвечает · сервер tracker 2.1.0" },
+  },
+  {
+    name: "архив",
+    info: { ...STDIO, sources: ["Claude Code: проект ~/work/shop"], script: "~/tools/archive-mcp/dist/index.js" },
+    seen: { ok: null, fact: NOT_RUNNING },
+    real: BROKEN,
+    onProbe: BROKEN,
+  },
+  {
+    name: "метрики",
+    info: { ...REMOTE, transport: "sse", host: "http://10.0.0.7:8811" },
+    seen: { ok: false, fact: "порт 8811: таймаут 3 с" },
+    onProbe: { ok: false, fact: "нет ответа, таймаут 20 с" },
+  },
+  {
+    name: "склад",
+    info: { ...STDIO, sources: ["~/work/shop/.mcp.json, выключен в настройках Claude"], script: "~/work/shop/tools/stock-mcp.js" },
+    seen: { ok: null, fact: NOT_RUNNING },
+    onProbe: { ok: true, fact: "отвечает · инструментов: 11" },
+  },
+];
+
+const mcpId = (d: McpDef) => `#mcp/${d.name}`;
+const mcpViews: NodeView[] = MCP_DEFS.map((d) => ({
+  id: mcpId(d), title: d.name, kind: "mcp", group: null, project: "MCP", on: null, dependsOn: [],
+  access: null, links: [], undeclared: false, hasLogs: false, mcp: d.info,
+}));
+const mcpReal = new Map(MCP_DEFS.flatMap((d) => (d.real ? [[mcpId(d), { ...d.real, at: Date.now() - 9 * 60_000 }] as const] : [])));
+const mcpSince = new Date(Date.now() - 3 * 3_600_000).toISOString();
+
+function mcpState(d: McpDef, at: number): NodeState {
+  const iso = new Date(at).toISOString();
+  const real = mcpReal.get(mcpId(d));
+  const failed = real && !real.ok;
+  const stdio = d.info.transport === "stdio";
+  const checks: CheckResult[] = [
+    { kind: stdio ? "process" : "tcp", target: stdio ? "процесс сервера" : (d.info.host ?? "").replace(/^\w+:\/\//, ""), from: null, ok: d.seen.ok, fact: d.seen.fact, latencyMs: d.seen.ok && !stdio ? jitter(30) : null, measuredAt: iso },
+  ];
+  if (real) checks.push({ kind: "mcp", target: "initialize и tools/list", from: null, ok: real.ok, fact: real.fact, latencyMs: null, measuredAt: new Date(real.at).toISOString() });
+  return {
+    id: mcpId(d),
+    own: failed ? "fail" : d.seen.ok === null ? "unchecked" : d.seen.ok ? "ok" : "fail",
+    confirmed: true,
+    fact: failed ? real.fact : d.seen.fact,
+    hints: [],
+    // Корень — только отказ настоящей проверки; закрытый порт и «не запущен» тревогой не считаются.
+    isRoot: !!failed,
+    blockedBy: [],
+    checks,
+    container: null,
+    measuredAt: iso,
+    since: mcpSince,
+  };
+}
+const mcpStates = (at = Date.now()) => Object.fromEntries(MCP_DEFS.map((d) => [mcpId(d), mcpState(d, at)]));
+
+async function mcpProbe(id: string): Promise<McpProbe> {
+  const d = MCP_DEFS.find((x) => mcpId(x) === id);
+  if (!d) throw `сервера «${id}» нет в настройках Claude`;
+  await new Promise((r) => setTimeout(r, 1500));
+  mcpReal.set(id, { ...d.onProbe, at: Date.now() });
+  emit("pult://states", { cycle, states: [mcpState(d, Date.now())] });
+  return d.onProbe;
+}
+
+async function ollamaAsk(model: string): Promise<OllamaAnswer> {
+  await new Promise((r) => setTimeout(r, 1800));
+  // Модель эмбеддингов отвечать текстом не умеет — так в макете видна и ошибка сервера «как есть».
+  if (model.includes("embed")) return { ok: false, fact: `"${model}" does not support generate`, seconds: null };
+  const cold = model !== "qwen3:8b";
+  return { ok: true, fact: cold ? "ответила за 6.4 с, из них загрузка в память — 5.8 с" : "ответила за 0.8 с", seconds: cold ? 6.4 : 0.8 };
 }
 
 // ───────────── Состояние макета ─────────────
@@ -433,8 +562,9 @@ function snapshot(): Snapshot {
         : null,
       warnings: visible ? ["узел «кэш»: незнакомое поле «приоритет», оно проигнорировано"] : [],
     },
-    nodes: visible ? views : [],
-    states: visible ? shown(states) : {},
+    // MCP-серверы ядро находит и без инвентаря — но одних их для карты мало (см. App).
+    nodes: visible ? [...views, ...mcpViews] : mcpViews,
+    states: visible ? { ...shown(states), ...mcpStates() } : mcpStates(),
   };
 }
 
@@ -480,6 +610,7 @@ function recheck(id?: string) {
   setTimeout(() => {
     const at = new Date().toISOString();
     const ids = id ? [id] : Object.keys(shown(states));
+    const local = Object.values(mcpStates()).filter((s) => !id || s.id === id);
     const upd = ids.filter((i) => states[i]).map((i) => {
       const cur = states[i];
       return (states[i] = {
@@ -488,7 +619,7 @@ function recheck(id?: string) {
         checks: cur.checks.map((c) => ({ ...c, measuredAt: at, latencyMs: c.latencyMs === null ? null : jitter(c.latencyMs) })),
       });
     });
-    emit("pult://states", { cycle, states: upd });
+    emit("pult://states", { cycle, states: [...upd, ...local] });
   }, 700);
 }
 
@@ -528,6 +659,10 @@ async function call(cmd: string, args: Record<string, unknown> = {}): Promise<un
       return null;
     case "get_update_blocker":
       return null;
+    case "ollama_ask":
+      return ollamaAsk(args.model as string);
+    case "mcp_probe":
+      return mcpProbe(args.id as string);
     case "check_environment": {
       const res: EnvCheck[] = [
         { name: "ssh", ok: true, detail: "/usr/bin/ssh (OpenSSH_9.8)" },

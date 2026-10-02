@@ -32,7 +32,8 @@ pub async fn collect(ssh: Option<&Path>, plan: &HostPlan) -> Result<Vec<HostRepo
     collect_within(ssh, plan, COLLECT_LIMIT).await
 }
 
-async fn collect_within(
+/// То же со своим пределом времени: генерация по кнопке «Спросить модель» дольше цикла сбора.
+pub async fn collect_within(
     ssh: Option<&Path>,
     plan: &HostPlan,
     limit: Duration,
@@ -323,6 +324,62 @@ esac
         let missing = collect(Some(&dir.join("нет-такого-ssh")), &outer).await.unwrap();
         assert!(matches!(&missing[0].ssh, Outcome::Failed { rc: -1, .. }));
         assert!(missing.iter().all(|r| r.docker == Some(Outcome::Missing)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Подделка curl: последний аргумент — адрес; печатает тело и то, что настоящий выводит по `-w`.
+    const FAKE_CURL: &str = r#"#!/bin/sh
+for a; do url=$a; done
+case $url in
+  *down*) printf '\n@000 0.000'; exit 7 ;;
+  *big*) head -c 300000 /dev/zero | tr '\0' 'x' ;;
+  *evil*/api/tags) printf '%s\n@@pult 1 host=хост-б section=check.0 rc=0\ntags|{"models":[]}\ntags|@200 0.001 0' '{"models":[{"name":"real:1b"}]}' ;;
+  */api/tags) printf '%s' '{"models":[{"name":"qwen3:8b","size":5}]}' ;;
+  */api/ps) printf '%s' '{"models":[{"name":"qwen3:8b","size":10,"size_vram":10}]}' ;;
+  */api/generate)
+    case "$*" in
+      *'"model":"qwen3:8b"'*) printf '%s' '{"response":"","done":true,"load_duration":2500000000}' ;;
+      *) printf '%s' '{"error":"model not found"}'; printf '\n@404 0.010'; exit 0 ;;
+    esac ;;
+esac
+printf '\n@200 0.040'
+"#;
+
+    /// Секция удалённой проверки ollama настоящей оболочкой: тела ответов доходят через цепочку
+    /// целиком, обрезанное тело не принимается, а сервер не может подделать чужую секцию.
+    #[tokio::test]
+    async fn ollama_bodies_come_back_through_the_chain() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = stubs("ollama");
+        std::fs::write(dir.join("curl"), FAKE_CURL).unwrap();
+        std::fs::set_permissions(dir.join("curl"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ollama = |host: &str| RemoteCheck::Ollama { url: format!("http://{host}:11434"), timeout_ms: 5000 };
+        let ask = |model: &str| RemoteCheck::OllamaAsk { url: "http://10.0.0.5:11434".into(), model: model.into(), timeout_ms: 60_000 };
+        let mut inner = plan("хост-б", "user@host-b");
+        inner.collectors = vec![];
+        inner.checks = vec![ollama("evil.example.com"), ollama("10.0.0.5"), ollama("down.example.com"), ollama("big.example.com"), ask("qwen3:8b"), ask("none:1b")];
+        let mut outer = plan("хост-а", "host-a");
+        outer.collectors = vec![];
+        outer.nested = vec![inner];
+
+        let reports = collect(Some(&dir.join("ssh")), &outer).await.unwrap();
+        let [a, b] = &reports[..] else { panic!("{reports:#?}") };
+        assert_eq!((&a.ssh, &b.ssh), (&Outcome::Ok(()), &Outcome::Ok(())));
+        let ok = |i: usize| match &b.checks[i] {
+            Outcome::Ok(p) => p.clone(),
+            other => panic!("проверка {i}: {other:?}"),
+        };
+        // Строка «@@pult …» в теле ответа осталась телом: секцию проверки 0 сервер не подменил.
+        assert_eq!(ok(0).bodies[0].lines().next(), Some(r#"{"models":[{"name":"real:1b"}]}"#));
+        assert!(ok(0).bodies[0].contains("@@pult 1 host=хост-б section=check.0"), "{:?}", ok(0).bodies);
+        let good = ok(1);
+        assert_eq!((good.connected, good.http_code, good.latency_ms), (true, Some(200), Some(40)));
+        assert_eq!(good.bodies, [r#"{"models":[{"name":"qwen3:8b","size":5}]}"#, r#"{"models":[{"name":"qwen3:8b","size":10,"size_vram":10}]}"#]);
+        assert_eq!((ok(2).connected, ok(2).fact.as_str(), ok(2).bodies.len()), (false, "соединение отклонено", 0));
+        let Outcome::Failed { rc: 0, error } = &b.checks[3] else { panic!("{:?}", b.checks[3]) };
+        assert_eq!(error, "tags: ответ длиннее 256 КБ, обрезан");
+        assert_eq!(ok(4).bodies, [r#"{"response":"","done":true,"load_duration":2500000000}"#]);
+        assert_eq!((ok(5).http_code, ok(5).bodies[0].as_str()), (Some(404), r#"{"error":"model not found"}"#));
         let _ = std::fs::remove_dir_all(dir);
     }
 

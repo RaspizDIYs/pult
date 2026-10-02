@@ -24,6 +24,7 @@ fn result(ok: Option<bool>, fact: &str, measured_at: OffsetDateTime) -> CheckRes
         fact: fact.into(),
         latency_ms: None,
         measured_at,
+        models: Vec::new(),
     }
 }
 

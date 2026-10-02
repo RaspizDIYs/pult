@@ -13,6 +13,7 @@ import {
   Globe,
   Layers,
   Link2Off,
+  Plug,
   Server,
   type LucideIcon,
 } from "lucide-react";
@@ -133,7 +134,8 @@ export function cardText(s: NodeState | undefined, titleOf: (id: string) => stri
       if (cause) return { fact: "неизвестно", cause };
       return s.own === "stale" ? { fact: `данные от ${fmtTime(s.measuredAt)}`, cause: null } : { fact: s.fact, cause: null };
     case "unchecked":
-      return { fact: "не проверяется", cause: null };
+      // У обычного узла факт и есть «не проверяется»; у MCP — «сейчас не запущен: …».
+      return { fact: s.fact || "не проверяется", cause: null };
     default:
       return { fact: s.fact, cause: null };
   }
@@ -155,6 +157,7 @@ const KINDS: Record<string, { label: string; Icon: LucideIcon }> = {
   service: { label: "Сервис", Icon: Layers },
   туннель: { label: "Туннель", Icon: Cable },
   tunnel: { label: "Туннель", Icon: Cable },
+  mcp: { label: "MCP-сервер", Icon: Plug },
 };
 export const kindInfo = (kind: string) => KINDS[kind] ?? { label: kind, Icon: Box };
 

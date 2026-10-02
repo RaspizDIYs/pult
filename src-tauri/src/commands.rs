@@ -30,6 +30,8 @@ pub struct NodeView {
     pub links: Vec<LinkView>,
     pub undeclared: bool,
     pub has_logs: bool,
+    /// Только у узлов MCP (`kind: "mcp"`): что о сервере можно показать.
+    pub mcp: Option<crate::mcp::McpInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +65,7 @@ impl NodeView {
             links: n.links.iter().map(|l| LinkView { title: l.title.clone(), url: l.url.clone() }).collect(),
             undeclared: false,
             has_logs: (n.container.is_some() || n.compose.is_some()) && docker_on_host,
+            mcp: None,
         }
     }
 }
@@ -214,4 +217,18 @@ pub async fn open_logs(core: Core<'_>, id: String, tail: Option<u32>) -> Result<
 #[tauri::command]
 pub fn close_logs(core: Core<'_>, stream_id: String) {
     core.close_logs(&stream_id);
+}
+
+/// «Спросить модель»: одна настоящая генерация на сервере Ollama узла. Только по кнопке —
+/// она грузит модель в память.
+#[tauri::command]
+pub async fn ollama_ask(core: Core<'_>, id: String, model: String) -> Result<crate::probes::ollama::Answer, String> {
+    core.ask_model(&id, &model).await
+}
+
+/// «Проверить по-настоящему»: рукопожатие MCP с сервером узла. Только по кнопке — на эти
+/// секунды запускается вторая копия сервера.
+#[tauri::command]
+pub async fn mcp_probe(core: Core<'_>, id: String) -> Result<crate::mcp::handshake::Probe, String> {
+    core.probe_mcp(&id).await
 }

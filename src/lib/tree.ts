@@ -1,4 +1,5 @@
 // Карта — дерево, как в проводнике: площадка → гостевые системы и папки проектов → сервисы.
+// Первая площадка — «Эта машина»: то, что Пульт нашёл сам на компьютере пользователя (MCP-серверы).
 // Дерево строится только по `на` (где размещён) и `проект`; зависимости в нём не участвуют —
 // их видно, когда узел выбран. Раскладка своя: колонки слева направо, раскрытая ветка — список
 // строк справа от себя, следующая площадка — ниже всего, что раскрыто у предыдущей.
@@ -7,7 +8,7 @@ import type { NodeState, NodeView } from "./pult";
 
 export interface TreeItem {
   key: string;
-  /** null — ветка без узла: «Сеть и внешнее» или папка проекта. */
+  /** null — ветка без узла: «Эта машина», «Сеть и внешнее» или папка проекта. */
   node: NodeView | null;
   title: string;
   parent: string | null;
@@ -24,8 +25,12 @@ export interface Tree {
 
 // Ключи веток без узла собраны через «#»: id узлов в инвентаре его не содержат.
 export const NET_KEY = "#сеть";
+export const LOCAL_KEY = "#эта-машина";
 const NO_PROJECT = "Общее";
 const MACHINE = new Set(["хост", "host", "вм", "vm"]);
+/** Виды узлов, которые живут на машине пользователя, а не в инвентаре. */
+const LOCAL = new Set(["mcp"]);
+export const isLocal = (n: NodeView) => LOCAL.has(n.kind);
 
 export function buildTree(nodes: NodeView[]): Tree {
   const ids = new Set(nodes.map((n) => n.id));
@@ -50,8 +55,9 @@ export function buildTree(nodes: NodeView[]): Tree {
   };
 
   // Сначала гостевые системы (они раскрываются дальше), затем сервисы — по папкам проектов.
-  // Папка из одного проекта ничего не говорит, поэтому тогда сервисы лежат прямо в ветке.
-  const contents = (key: string, list: NodeView[]): string[] => {
+  // Папка из одного проекта ничего не говорит, поэтому тогда сервисы лежат прямо в ветке —
+  // кроме «Этой машины» (`folders`): там папка называет, что это за узлы.
+  const contents = (key: string, list: NodeView[], folders = false): string[] => {
     const guest = (n: NodeView) => MACHINE.has(n.kind) || hosted.has(n.id);
     const out = list.filter(guest).map((g) => addNode(g, key));
     const byProject = new Map<string, NodeView[]>();
@@ -59,7 +65,7 @@ export function buildTree(nodes: NodeView[]): Tree {
       const p = s.project?.trim() || NO_PROJECT;
       byProject.set(p, [...(byProject.get(p) ?? []), s]);
     }
-    if (byProject.size <= 1) return [...out, ...[...byProject.values()].flat().map((s) => addNode(s, key))];
+    if (byProject.size <= 1 && !folders) return [...out, ...[...byProject.values()].flat().map((s) => addNode(s, key))];
     const order = [...byProject.keys()].sort((a, b) => Number(a === NO_PROJECT) - Number(b === NO_PROJECT));
     for (const p of order) {
       const folder = put(`${key}#${p}`, null, p, key);
@@ -73,7 +79,12 @@ export function buildTree(nodes: NodeView[]): Tree {
   // туннели) — одной веткой, на месте первого из них.
   const top: string[] = [];
   const net: NodeView[] = [];
-  for (const n of nodes.filter((n) => !parentOf(n))) {
+  const local = nodes.filter(isLocal);
+  if (local.length) {
+    top.push(LOCAL_KEY);
+    put(LOCAL_KEY, null, "Эта машина", null).children = contents(LOCAL_KEY, local, true);
+  }
+  for (const n of nodes.filter((n) => !parentOf(n) && !isLocal(n))) {
     if (MACHINE.has(n.kind)) top.push(addNode(n, null));
     else {
       if (!net.length) top.push(NET_KEY);
