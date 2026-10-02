@@ -1,5 +1,6 @@
-//! Рой агентов: кто в сети, кто что держит, кто чего ждёт. Только чтение — ни замков,
-//! ни писем, ни отметок присутствия: Пульт смотрит на рой, а не участвует в нём.
+//! Рой агентов: кто в сети, кто что держит, кто чего ждёт. Пульт смотрит на рой, а не
+//! участвует в нём: ни своих замков, ни писем, ни отметок присутствия. Единственное действие —
+//! снять замок, который уже считается проблемой, и только по кнопке с подтверждением.
 //!
 //! Два источника, и второй не зависит от первого:
 //! - хаб роя (`GET /state` и поток `GET /events`) — общие замки, сессии всех машин, доска,
@@ -13,7 +14,7 @@
 //! интерфейсу — у конфига нет даже `Debug`.
 
 use crate::probes::innermost;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -115,7 +116,7 @@ pub struct SessionView {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
     Fleet,
@@ -225,6 +226,18 @@ pub struct LocalView {
     pub runs: Vec<RunView>,
     /// Файлы, которые не прочитались. Остальное при этом показано.
     pub errors: Vec<String>,
+    /// Почему локальный замок отсюда не снять (нет `node` или диспетчера); None — можно.
+    pub release_error: Option<String>,
+}
+
+/// Итог снятия замка — по перечитанному состоянию, а не по ответу «ок».
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseResult {
+    pub released: bool,
+    pub message: String,
+    /// Вывод диспетчера (локальный замок): какие процессы погашены, какие нет.
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -525,11 +538,21 @@ fn check_status(resp: &reqwest::Response) -> Result<(), String> {
     }
 }
 
-async fn fetch_state(client: &reqwest::Client, cfg: &HubConfig) -> Result<Value, String> {
-    let resp = get(client, cfg, "/state").timeout(STATE_TIMEOUT).send().await.map_err(|e| net_error(&e))?;
+async fn json_of(req: reqwest::RequestBuilder) -> Result<Value, String> {
+    let resp = req.timeout(STATE_TIMEOUT).send().await.map_err(|e| net_error(&e))?;
     check_status(&resp)?;
     let body = resp.bytes().await.map_err(|e| net_error(&e))?;
     serde_json::from_slice(&body).map_err(|e| format!("хаб прислал не JSON: {e}"))
+}
+
+async fn fetch_state(client: &reqwest::Client, cfg: &HubConfig) -> Result<Value, String> {
+    json_of(get(client, cfg, "/state")).await
+}
+
+/// Единственная запись в хаб — снятие замка. Тот же адрес и токен, что у чтения.
+async fn post(client: &reqwest::Client, cfg: &HubConfig, route: &str, body: &Value) -> Result<Value, String> {
+    let req = client.post(format!("{}{route}", cfg.url)).header(reqwest::header::CONTENT_TYPE, "application/json").body(body.to_string());
+    json_of(if cfg.token.is_empty() { req } else { req.bearer_auth(&cfg.token) }).await
 }
 
 /// Вынимает из буфера законченные кадры SSE: `(событие, данные)`. Пульс (`: ping`) и
@@ -973,8 +996,199 @@ fn build(hub: Option<&Part>, info: HubInfo, local: &Part, now: i64) -> FleetView
             resources: local.resources.clone(),
             runs: local.runs.clone(),
             errors: local.errors.clone(),
+            release_error: None,
         },
     }
+}
+
+// ───────────── Названия чатов ─────────────
+
+/// Данные приложения Claude Desktop: там лежат записи о чатах с их названиями.
+fn desktop_chats_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) { PathBuf::from(std::env::var_os("APPDATA")?) } else { std::env::home_dir()?.join("Library").join("Application Support") };
+    Some(base.join("Claude").join("claude-code-sessions"))
+}
+
+fn paths_in(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| Some(e.ok()?.path())).collect()
+}
+
+/// Названия чатов Claude на этой машине: идентификатор сессии → название, каким чат виден
+/// в списке приложения. «Чат 4b9c» никто не помнит, а название человек дал (или увидел) сам.
+/// Источника два, оба — чужие файлы, поэтому всё нечитаемое молча пропускаем:
+/// - Claude Desktop: `claude-code-sessions/<аккаунт>/<организация>/local_*.json`, поля
+///   `cliSessionId` и `title`. Запись остаётся и после закрытия чата — а имя нужнее всего
+///   именно ушедшему держателю замка;
+/// - сам Claude Code: `~/.claude/sessions/<pid>.json`, поля `sessionId` и `name`. Только
+///   запущенные сессии, зато и те, что открыты в терминале. Они свежее — кладём поверх.
+// ponytail: читаем все записи чатов раз в минуту; счёт пойдёт на тысячи — кэш по времени изменения.
+fn chat_titles(desktop: Option<&Path>, live: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut take = |file: &Path, id: &str, title: &str| {
+        let Some(v) = std::fs::read(file).ok().and_then(|raw| serde_json::from_slice::<Value>(&raw).ok()) else { return };
+        if let (Some(id), Some(title)) = (text(&v, id), text(&v, title)) {
+            out.insert(id, title);
+        }
+    };
+    for file in desktop.into_iter().flat_map(paths_in).flat_map(|account| paths_in(&account)).flat_map(|org| paths_in(&org)) {
+        take(&file, "cliSessionId", "title");
+    }
+    for file in paths_in(live) {
+        take(&file, "sessionId", "name");
+    }
+    out
+}
+
+fn titles() -> HashMap<String, String> {
+    chat_titles(desktop_chats_dir().as_deref(), &std::env::home_dir().unwrap_or_default().join(".claude").join("sessions"))
+}
+
+/// Имя из роя главнее: им сессию зовут агенты, на него приходят письма. Название чата —
+/// только когда в рою она не представилась.
+fn fill_names(view: &mut FleetView, titles: &HashMap<String, String>) {
+    for s in view.sessions.iter_mut().filter(|s| s.name.is_none()) {
+        s.name = titles.get(&s.id).cloned();
+    }
+}
+
+// ───────────── Действие: снять замок ─────────────
+
+/// `mine` опрашивает процессы машины; на винде это секунды, а не миллисекунды.
+const DISPATCHER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Приложение, открытое из Finder, получает PATH без Homebrew — два привычных места смотрим сами.
+// ponytail: nvm, fnm и volta не ищем — кнопка честно скажет «не найден node»; понадобится — путь в настройки.
+fn find_node() -> Option<PathBuf> {
+    crate::system::find("node").or_else(|| ["/opt/homebrew/bin/node", "/usr/local/bin/node"].into_iter().map(PathBuf::from).find(|p| p.is_file()))
+}
+
+/// Установленный диспетчер этой машины: чем запускать и что. Ошибка — готовое объяснение для кнопки.
+fn dispatcher(dir: &Path, node: Option<PathBuf>) -> Result<(PathBuf, PathBuf), String> {
+    let script = dir.join("orch.mjs");
+    if !script.is_file() {
+        return Err(format!("диспетчер не установлен: нет {}", tilde(script.to_string_lossy().into_owned())));
+    }
+    Ok((node.ok_or("не найден node — запустить диспетчер нечем")?, script))
+}
+
+/// `node orch.mjs mine --session <id> [--kill]` — команда диспетчера про всё, что держит
+/// сессия: без `--kill` только перечисляет замки, талоны и процессы, с ним — гасит процессы
+/// и отпускает замки. Каталоги замков сами не трогаем: их формат и порядок уборки (процессы,
+/// талоны, доска, хаб) знает диспетчер, и вторая реализация разошлась бы с первой.
+async fn run_mine(dir: &Path, node: Option<PathBuf>, session: &str, kill: bool) -> Result<String, String> {
+    let (node, script) = dispatcher(dir, node)?;
+    // Идентификатор уходит аргументом; начинайся он с дефиса, диспетчер принял бы его за флаг.
+    if session.is_empty() || session.starts_with('-') {
+        return Err("у держателя странный идентификатор — диспетчеру его не передать".into());
+    }
+    let mut cmd = crate::system::command(&node);
+    // Каталог состояния называем явно: диспетчер должен работать с теми же файлами, что читаем мы.
+    cmd.arg(&script).args(["mine", "--session", session]).env("AGENT_ORCH_DIR", dir);
+    if kill {
+        cmd.arg("--kill");
+    }
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
+    let out = tokio::time::timeout(DISPATCHER_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| format!("диспетчер не ответил за {} с", DISPATCHER_TIMEOUT.as_secs()))?
+        .map_err(|e| format!("диспетчер не запустился: {e}"))?;
+    let said = |raw: &[u8]| String::from_utf8_lossy(raw).trim_end().to_string();
+    if out.status.success() {
+        Ok(said(&out.stdout))
+    } else {
+        Err(format!("диспетчер завершился с ошибкой: {}", [said(&out.stderr), said(&out.stdout)].join("\n").trim()))
+    }
+}
+
+/// Замок, который можно снимать: он на месте, держит его та же сессия, и он всё ещё проблема.
+/// Сверяем по свежей картине прямо перед действием: пока человек читал диалог, замок мог
+/// перейти к живой сессии, и принудительный сброс выбил бы уже её.
+fn releasable<'a>(view: &'a FleetView, scope: Scope, key: &str, session: &str) -> Result<&'a LockView, String> {
+    let lock = view
+        .locks
+        .iter()
+        .find(|l| l.scope == scope && l.key == key && l.session.as_deref() == Some(session))
+        .ok_or("этого замка уже нет: держатель отпустил его сам или его сняла уборка")?;
+    if lock.problem.is_none() {
+        return Err("замок больше не проблема: держатель на связи и укладывается в срок — снимать не стал".into());
+    }
+    Ok(lock)
+}
+
+/// Тело `POST /lease/release`, как его читает хаб (fleet/server.mjs, `release`): ключ замка он
+/// собирает сам из `repo` и `resource`, поэтому `repo` берём из ключа, а не из подписи.
+/// `force` — потому что снимаем не от имени держателя; в журнале хаба это останется
+/// «аварийным сбросом», а не «штатно».
+fn release_body(lock: &LockView) -> Value {
+    let repo = lock.key.strip_suffix(&format!("::{}", lock.resource)).unwrap_or("-");
+    serde_json::json!({ "resource": lock.resource, "repo": repo, "session": lock.session, "force": true })
+}
+
+/// Ответ хаба: `{ok:true, freed}` или `{ok:false, error}`. `freed:false` — замка уже не было,
+/// и это не ошибка: итог всё равно решает перечитанное состояние.
+fn release_reply(v: &Value) -> Result<(), String> {
+    match v.get("ok").and_then(Value::as_bool) {
+        Some(true) => Ok(()),
+        _ => Err(format!("хаб отказал: {}", text(v, "error").unwrap_or_else(|| "без объяснения".into()))),
+    }
+}
+
+/// Свежая картина для проверки до и после действия: хаб (если настроен и отвечает) и файлы машины.
+async fn picture(dir: &Path) -> (Result<Part, String>, Part) {
+    let hub = match read_config(dir) {
+        Config::Hub(cfg) => match hub_client() {
+            Ok(client) => fetch_state(&client, &cfg).await.map(|v| parse_hub(&v, now_ms())),
+            Err(e) => Err(e),
+        },
+        Config::Broken(e) => Err(e),
+        Config::Off => Err("рой на этой машине не настроен".into()),
+    };
+    (hub, read_local(dir, now_ms()))
+}
+
+/// Снять замок и сказать, что вышло на самом деле. Возвращает и перечитанное состояние —
+/// чтобы экран обновился сразу, а не через цикл опроса.
+async fn release(dir: &Path, node: Option<PathBuf>, scope: Scope, key: &str, session: &str) -> (ReleaseResult, Option<Part>, Part) {
+    let info = || HubInfo { state: HubState::Ok, address: None, error: None, last_ok_at: None };
+    let fail = |message: String| ReleaseResult { released: false, message, output: None };
+
+    let (hub, local) = picture(dir).await;
+    if let (Scope::Fleet, Err(e)) = (scope, &hub) {
+        return (fail(format!("хаб недоступен: {e}")), None, local);
+    }
+    let before = build(hub.as_ref().ok(), info(), &local, now_ms());
+    let lock = match releasable(&before, scope, key, session) {
+        Ok(lock) => lock,
+        Err(e) => return (fail(e), hub.ok(), local),
+    };
+
+    let acted: Result<Option<String>, String> = match scope {
+        Scope::Fleet => match (read_config(dir), hub_client()) {
+            (Config::Hub(cfg), Ok(client)) => post(&client, &cfg, "/lease/release", &release_body(lock)).await.and_then(|v| release_reply(&v)).map(|_| None),
+            (_, Err(e)) => Err(e),
+            _ => Err("fleet.json изменился, пока шло действие".into()),
+        },
+        Scope::Local => run_mine(dir, node, session, true).await.map(Some),
+    };
+
+    // «Снят» — только если замка нет в перечитанном состоянии: «ок» в ответе бывает и там,
+    // где ничего не произошло.
+    let (hub, local) = picture(dir).await;
+    if let (Scope::Fleet, Err(e)) = (scope, &hub) {
+        return (fail(format!("хаб перестал отвечать ({e}) — снят ли замок, неизвестно")), None, local);
+    }
+    let after = build(hub.as_ref().ok(), info(), &local, now_ms());
+    let still = after.locks.iter().any(|l| l.scope == scope && l.key == key && l.session.as_deref() == Some(session));
+    let output = acted.as_ref().ok().cloned().flatten();
+    let message = match (&acted, still) {
+        (Ok(_), false) => "замок снят".to_string(),
+        (Err(e), false) => format!("замок снят, хотя действие закончилось ошибкой: {e}"),
+        (Ok(_), true) if scope == Scope::Fleet => "хаб ответил «ок», но замок на месте".to_string(),
+        (Ok(_), true) => "диспетчер отработал, но замок на месте".to_string(),
+        (Err(e), true) => e.clone(),
+    };
+    (ReleaseResult { released: !still, message, output }, hub.ok(), local)
 }
 
 // ───────────── Жизненный цикл ─────────────
@@ -989,6 +1203,7 @@ struct Inner {
     hub: HubInfo,
     hub_part: Option<Part>,
     local: Part,
+    titles: HashMap<String, String>,
     /// Последнее отправленное интерфейсу — чтобы не слать одно и то же каждые 5 секунд.
     sent: Option<FleetView>,
 }
@@ -998,7 +1213,7 @@ impl Fleet {
         let dir = orchestrator_dir();
         let local = read_local(&dir, now_ms());
         let hub = HubInfo { state: HubState::Connecting, address: None, error: None, last_ok_at: None };
-        let fleet = Arc::new(Self { app, dir, inner: Mutex::new(Inner { hub, hub_part: None, local, sent: None }) });
+        let fleet = Arc::new(Self { app, dir, inner: Mutex::new(Inner { hub, hub_part: None, local, titles: titles(), sent: None }) });
         tauri::async_runtime::spawn(fleet.clone().hub_loop());
         tauri::async_runtime::spawn(fleet.clone().local_loop());
         fleet
@@ -1016,7 +1231,27 @@ impl Fleet {
     fn view_of(&self, s: &Inner) -> FleetView {
         let mut v = build(s.hub_part.as_ref(), s.hub.clone(), &s.local, now_ms());
         v.local.dir = tilde(self.dir.to_string_lossy().into_owned());
+        v.local.release_error = dispatcher(&self.dir, find_node()).err();
+        fill_names(&mut v, &s.titles);
         v
+    }
+
+    /// Сухой прогон диспетчера для диалога: что он знает о сессии-держателе и что погасит.
+    async fn release_preview(&self, key: &str, session: &str) -> Result<String, String> {
+        releasable(&self.view(), Scope::Local, key, session)?;
+        run_mine(&self.dir, find_node(), session, false).await
+    }
+
+    async fn release_lock(&self, scope: Scope, key: &str, session: &str) -> ReleaseResult {
+        let (result, hub, local) = release(&self.dir, find_node(), scope, key, session).await;
+        self.publish(|s| {
+            s.local = local;
+            // Хаб в беде — его снимок не подменяем: плашка «недоступен» с живыми замками под ней врала бы.
+            if let (Some(part), HubState::Ok) = (hub, s.hub.state) {
+                s.hub_part = Some(part);
+            }
+        });
+        result
     }
 
     fn publish(&self, change: impl FnOnce(&mut Inner)) {
@@ -1035,10 +1270,17 @@ impl Fleet {
     }
 
     async fn local_loop(self: Arc<Self>) {
-        loop {
+        for tick in 1u32.. {
             tokio::time::sleep(LOCAL_POLL).await;
             let local = read_local(&self.dir, now_ms());
-            self.publish(|s| s.local = local);
+            // Названия меняются редко, а записей о чатах сотни — их перечитываем раз в минуту.
+            let titles = (tick % 12 == 0).then(titles);
+            self.publish(|s| {
+                s.local = local;
+                if let Some(titles) = titles {
+                    s.titles = titles;
+                }
+            });
         }
     }
 
@@ -1183,6 +1425,30 @@ pub fn get_fleet(fleet: State<'_, Arc<Fleet>>) -> FleetView {
     // Зовётся раз на открытие окна — строка в логе не шумит, а отвечает, дошло ли окно до роя.
     log::info!("рой: get_fleet — хаб {:?}, сессий {}, проблем {}", view.hub.state, view.sessions.len(), view.problems);
     view
+}
+
+/// Что диспетчер знает о держателе локального замка — показать до подтверждения.
+#[tauri::command]
+pub async fn fleet_release_preview(fleet: State<'_, Arc<Fleet>>, key: String, session: String) -> Result<String, String> {
+    fleet.release_preview(&key, &session).await
+}
+
+/// Снять проблемный замок. Ошибкой не отвечает: отказ — тоже итог, и его показывают тем же текстом.
+#[tauri::command]
+pub async fn fleet_release_lock(fleet: State<'_, Arc<Fleet>>, scope: Scope, key: String, session: String) -> Result<ReleaseResult, ()> {
+    let before = fleet.view();
+    let holder = before.sessions.iter().find(|s| s.id == session).and_then(|s| s.name.clone()).unwrap_or_else(|| "без имени".into());
+    let result = fleet.release_lock(scope, &key, &session).await;
+    // Действие меняет чужую работу — в логе остаётся, с какой машины, что и чем кончилось.
+    log::info!(
+        "рой: снятие замка с машины {}: {key} ({}), держатель «{holder}» ({session}) — {}: {}{}",
+        before.machine.as_deref().unwrap_or("?"),
+        if scope == Scope::Fleet { "общий, хаб" } else { "локальный, диспетчер" },
+        if result.released { "снят" } else { "НЕ снят" },
+        result.message,
+        result.output.as_deref().map(|o| format!(" | {}", o.replace('\n', " | "))).unwrap_or_default(),
+    );
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1384,6 +1650,217 @@ mod tests {
         assert!(json["locks"][0].get("ttlMin").is_some());
     }
 
+    const GONE: &str = "dddd4444-0000-4000-8000-000000000004";
+
+    /// Кнопка есть только у проблемного замка, и снимается он только у того же держателя.
+    #[test]
+    fn release_only_for_problem_lock() {
+        let hub = parse_hub(&fixture(), NOW);
+        let v = build(Some(&hub), hub_info(), &Part::default(), NOW);
+        let deploy = releasable(&v, Scope::Fleet, "shop-1a2b3c4d::deploy", GONE).expect("держатель не в сети — снимать можно");
+        assert_eq!(release_body(deploy), serde_json::json!({ "resource": "deploy", "repo": "shop-1a2b3c4d", "session": GONE, "force": true }));
+
+        let healthy = releasable(&v, Scope::Fleet, "pult-9f8e7d6c::db-migrate", "cccc3333-0000-4000-8000-000000000003");
+        assert!(healthy.unwrap_err().contains("больше не проблема"));
+        // Замок успел перейти к другой сессии — прежнего держателя с этим ключом уже нет.
+        assert!(releasable(&v, Scope::Fleet, "shop-1a2b3c4d::deploy", "cccc3333-0000-4000-8000-000000000003").unwrap_err().contains("уже нет"));
+        assert!(releasable(&v, Scope::Local, "shop-1a2b3c4d::deploy", GONE).is_err(), "общий замок — не локальный");
+
+        // Замок вне репозитория: хаб хранит его под ключом `-::ресурс` и ждёт тот же `repo`.
+        let bare = LockView { key: "-::push".into(), resource: "push".into(), repo: None, ..deploy.clone() };
+        assert_eq!(release_body(&bare)["repo"], "-");
+    }
+
+    #[test]
+    fn release_reply_is_read_as_hub_writes_it() {
+        assert!(release_reply(&serde_json::json!({ "ok": true, "freed": true, "next": null })).is_ok());
+        assert!(release_reply(&serde_json::json!({ "ok": true, "freed": false })).is_ok(), "замка уже не было — не отказ");
+        let refused = release_reply(&serde_json::json!({ "ok": false, "error": "замок держит другая сессия" })).unwrap_err();
+        assert_eq!(refused, "хаб отказал: замок держит другая сессия");
+        assert!(release_reply(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn dispatcher_missing_is_explained() {
+        let dir = temp_dir("dispatcher");
+        let node = Some(PathBuf::from("node"));
+        assert!(dispatcher(&dir, node.clone()).unwrap_err().starts_with("диспетчер не установлен"));
+        write(&dir, "orch.mjs", "");
+        assert!(dispatcher(&dir, None).unwrap_err().contains("не найден node"));
+        assert!(dispatcher(&dir, node).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Название чата — имя только для сессии, которая в рою не представилась.
+    #[test]
+    fn chat_title_names_session_without_fleet_name() {
+        let dir = temp_dir("titles");
+        let (named, unnamed, terminal) = ("aaaa1111-0000-4000-8000-000000000001", GONE, "ffff6666-0000-4000-8000-000000000006");
+        write(&dir, "desktop/acc/org/local_1.json", &format!(r#"{{"cliSessionId":"{named}","title":"Экран роя"}}"#));
+        write(&dir, "desktop/acc/org/local_2.json", &format!(r#"{{"cliSessionId":"{unnamed}","title":"Выкатка 2.14"}}"#));
+        write(&dir, "desktop/acc/org/local_3.json", r#"{"title":"чат без сессии"}"#);
+        write(&dir, "desktop/acc/org/local_4.json", "не json");
+        write(&dir, "live/101.json", &format!(r#"{{"sessionId":"{terminal}","name":"Чиню сборку"}}"#));
+        write(&dir, "live/102.json", &format!(r#"{{"sessionId":"{unnamed}","name":"Выкатка 2.15"}}"#));
+        write(&dir, "live/103.json", r#"{"sessionId":"без-названия","name":""}"#);
+
+        let titles = chat_titles(Some(&dir.join("desktop")), &dir.join("live"));
+        assert_eq!(titles.len(), 3, "{titles:?}");
+        assert_eq!(titles[unnamed], "Выкатка 2.15", "запись запущенной сессии свежее записи чата");
+        assert_eq!(titles[terminal], "Чиню сборку");
+        assert!(chat_titles(None, &dir.join("нет-такого")).is_empty());
+
+        let hub = parse_hub(&fixture(), NOW);
+        let mut v = build(Some(&hub), hub_info(), &Part::default(), NOW);
+        assert_eq!(session(&v, unnamed).name, None);
+        fill_names(&mut v, &titles);
+        assert_eq!(session(&v, unnamed).name.as_deref(), Some("Выкатка 2.15"));
+        assert_eq!(session(&v, named).name.as_deref(), Some("карта"), "имя из роя главнее названия чата");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Снятие замка на настоящих хабе и диспетчере роя ──
+    //
+    // Нужны `node` и репозиторий agent-orchestrator: рядом с Пультом или в `PULT_FLEET_REPO`.
+    // Нет их — тесты пропускаются. Хаб поднимается свой, на свободном порту и во временном
+    // каталоге; рабочий хаб машины не участвует ни в одном запросе.
+
+    fn fleet_repo() -> Option<(PathBuf, PathBuf)> {
+        let repo = std::env::var_os("PULT_FLEET_REPO").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agent-orchestrator"));
+        // FLEET_URL в окружении главнее fleet.json — с ним тест пошёл бы в чужой хаб.
+        let usable = repo.join("fleet/server.mjs").is_file() && repo.join("orch.mjs").is_file() && std::env::var_os("FLEET_URL").is_none();
+        match (find_node(), usable) {
+            (Some(node), true) => Some((node, repo)),
+            _ => {
+                eprintln!("пропуск: нет node или репозитория роя ({})", repo.display());
+                None
+            }
+        }
+    }
+
+    struct Hub(std::process::Child);
+    impl Drop for Hub {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Общий замок: держатель молчит 25 минут, второй ждёт в очереди. Проверяется и отказ
+    /// (чужой токен), и то, что здоровый замок кодом Пульта не снимается.
+    #[test]
+    fn releases_fleet_lock_on_local_hub() {
+        let Some((node, repo)) = fleet_repo() else { return };
+        let dir = temp_dir("hub");
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+        let now = now_ms();
+        // Замолчавшего держателя запросами не получить: хаб считает молчание от последнего
+        // запроса, а 20 минут тест ждать не может. Поэтому держатель и его замок — в снимке,
+        // с которого хаб стартует; всё остальное — настоящими запросами.
+        let seeded = serde_json::json!({
+            "sessions": { "quiet": { "machine": "ноут-б", "name": "", "at": now - 25 * MIN } },
+            "locks": { "shop-1a2b::deploy": { "resource": "deploy", "repo": "shop-1a2b", "session": "quiet", "machine": "ноут-б", "command": "./deploy.sh", "reason": "", "since": now - 25 * MIN } },
+        });
+        write(&dir, "state/state.json", &seeded.to_string());
+        let _hub = Hub(
+            crate::system::command(&node)
+                .arg(repo.join("fleet/server.mjs"))
+                .envs([("FLEET_PORT", port.to_string()), ("FLEET_TOKEN", "test-token".into()), ("FLEET_STATE", dir.join("state").to_string_lossy().into_owned())])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        write(&dir, "fleet.json", &serde_json::json!({ "url": url, "token": "test-token" }).to_string());
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let Config::Hub(cfg) = read_config(&dir) else { panic!("конфиг не прочитан") };
+            let client = hub_client().unwrap();
+            for _ in 0..50 {
+                if fetch_state(&client, &cfg).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let acquire = |resource: &'static str, session: &'static str| {
+                let body = serde_json::json!({ "resource": resource, "repo": "shop-1a2b", "session": session, "machine": "мак-а" });
+                let (client, cfg) = (&client, &cfg);
+                async move { post(client, cfg, "/lease/acquire", &body).await.unwrap() }
+            };
+            assert_eq!(acquire("deploy", "waiting").await["ok"], false, "второй встаёт в очередь");
+            assert_eq!(acquire("push", "waiting").await["ok"], true);
+
+            // Здоровый замок: держатель только что отметился — снимать нечего.
+            let (r, _, _) = release(&dir, None, Scope::Fleet, "shop-1a2b::push", "waiting").await;
+            assert!(!r.released && r.message.contains("больше не проблема"), "{r:?}");
+
+            // Чужой токен: хаб отказывает, замок остаётся.
+            write(&dir, "fleet.json", &serde_json::json!({ "url": url, "token": "чужой" }).to_string());
+            let (r, _, _) = release(&dir, None, Scope::Fleet, "shop-1a2b::deploy", "quiet").await;
+            assert!(!r.released && r.message.contains("отказал в доступе"), "{r:?}");
+            write(&dir, "fleet.json", &serde_json::json!({ "url": url, "token": "test-token" }).to_string());
+
+            let before = build(Some(&parse_hub(&fetch_state(&client, &cfg).await.unwrap(), now_ms())), hub_info(), &Part::default(), now_ms());
+            let lock = releasable(&before, Scope::Fleet, "shop-1a2b::deploy", "quiet").unwrap();
+            assert_eq!(lock.problem, Some(Problem::Silent));
+            assert_eq!(lock.queue.len(), 1);
+
+            let (r, hub, _) = release(&dir, None, Scope::Fleet, "shop-1a2b::deploy", "quiet").await;
+            assert_eq!(r, ReleaseResult { released: true, message: "замок снят".into(), output: None });
+            assert!(hub.unwrap().locks.iter().all(|l| l.session != "quiet"));
+            // Очередь двинулась: ждавший берёт освободившийся замок.
+            assert_eq!(acquire("deploy", "waiting").await["ok"], true);
+            // Повтор по уже снятому замку — отказ, а не второй сброс по новому держателю.
+            let (r, _, _) = release(&dir, None, Scope::Fleet, "shop-1a2b::deploy", "quiet").await;
+            assert!(!r.released && r.message.contains("уже нет"), "{r:?}");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Локальный замок ушедшей сессии снимает диспетчер: сухой прогон называет процесс,
+    /// настоящий — гасит его и убирает замок.
+    #[cfg(unix)]
+    #[test]
+    fn releases_local_lock_with_dispatcher() {
+        let Some((node, repo)) = fleet_repo() else { return };
+        let dir = temp_dir("mine");
+        std::fs::copy(repo.join("orch.mjs"), dir.join("orch.mjs")).unwrap();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        for file in paths_in(&repo.join("lib")) {
+            std::fs::copy(&file, dir.join("lib").join(file.file_name().unwrap())).unwrap();
+        }
+        let now = now_ms();
+        // Полминуты, а не час: если тест упадёт раньше, чем диспетчер погасит процесс, тот уйдёт сам.
+        let mut stuck = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = stuck.id();
+        // Завершившегося потомка надо забрать, иначе он остаётся зомби и для диспетчера «жив».
+        let reaped = std::thread::spawn(move || stuck.wait());
+        // Ресурс машины, а не проекта: ключ проектного диспетчер считает из папки держателя.
+        write(&dir, "locks/heavy-misc#1/holder.json", &format!(r#"{{"session":"gone","resource":"heavy-misc","machine":"мак-а","cwd":"/work/shop","command":"docker build .","since":"{}"}}"#, iso(now - 180 * MIN)));
+        write(&dir, "fleet-beat-gone.json", &format!(r#"{{"at":{}}}"#, now - 170 * MIN));
+        write(&dir, "owned-procs.json", &format!(r#"[{{"pid":{pid},"session":"gone","resource":"heavy-misc","cmd":"sleep 30","verified":true}}]"#));
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let dry = run_mine(&dir, Some(node.clone()), "gone", false).await.unwrap();
+            assert!(dry.contains("heavy-misc") && dry.contains(&pid.to_string()), "{dry}");
+            assert!(dir.join("locks/heavy-misc#1").exists(), "сухой прогон ничего не снимает");
+
+            // Без node действие не начинается, и замок на месте.
+            let (r, _, _) = release(&dir, None, Scope::Local, "heavy-misc", "gone").await;
+            assert!(!r.released && r.message.contains("не найден node"), "{r:?}");
+
+            let (r, _, local) = release(&dir, Some(node), Scope::Local, "heavy-misc", "gone").await;
+            assert!(r.released && r.message == "замок снят", "{r:?}");
+            assert!(r.output.unwrap().contains(&pid.to_string()), "вывод диспетчера называет погашенный процесс");
+            assert!(local.locks.is_empty());
+        });
+        assert!(reaped.join().unwrap().is_ok_and(|status| !status.success()), "процесс держателя погашен, а не доработал сам");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Живой хаб этой машины, только чтение. Запуск: `cargo test live_hub -- --ignored --nocapture`.
     /// Печатает одни числа: имена, пути и токен в вывод не попадают.
     #[test]
@@ -1394,7 +1871,11 @@ mod tests {
         let client = hub_client().unwrap();
         let state = rt.block_on(fetch_state(&client, &cfg)).expect("хаб не ответил");
         let now = now_ms();
-        let v = build(Some(&parse_hub(&state, now)), hub_info(), &read_local(&orchestrator_dir(), now), now);
+        let mut v = build(Some(&parse_hub(&state, now)), hub_info(), &read_local(&orchestrator_dir(), now), now);
+        let unnamed = v.sessions.iter().filter(|s| s.name.is_none()).count();
+        let titles = titles();
+        fill_names(&mut v, &titles);
+        println!("названий чатов на машине {}, сессий без имени {unnamed} → после названий {}", titles.len(), v.sessions.iter().filter(|s| s.name.is_none()).count());
         let online: Vec<_> = v.sessions.iter().filter(|s| s.presence == Presence::Online).collect();
         let machines: std::collections::HashSet<_> = online.iter().filter_map(|s| s.machine.as_ref()).collect();
         let held = |scope| v.locks.iter().filter(|l| l.scope == scope && l.session.is_some()).count();

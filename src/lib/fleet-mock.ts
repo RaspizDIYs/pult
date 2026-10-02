@@ -8,7 +8,12 @@
 //   off       — рой на машине не настроен;
 //   empty     — хаб на связи, в рою никого;
 //   loading   — ядро не отвечает на первый запрос.
-import type { FleetLock, FleetSession, FleetTask, FleetView } from "./fleet";
+//
+// Параметр ?release= — чем кончается «Снять замок»:
+//   ok (по умолчанию) — замок исчезает из картины;
+//   refused           — хаб отказал, замок на месте;
+//   no-dispatcher     — на машине нет диспетчера: кнопка локального замка неактивна.
+import type { FleetLock, FleetSession, FleetTask, FleetView, ReleaseResult } from "./fleet";
 
 const MIN = 60_000;
 const t0 = Date.now();
@@ -103,6 +108,7 @@ const LOCAL = {
     { resource: "e2e", session: S.ghost, command: "npx playwright test", cwd: "~/projects/shop", startedAt: ago(300), background: true },
   ],
   errors: ["runs/shop-77aa__e2e.json: битый JSON (EOF while parsing an object at line 1 column 212)"],
+  releaseError: null as string | null,
 };
 
 function problems(): FleetView {
@@ -181,14 +187,49 @@ function off(): FleetView {
 }
 
 const SCENARIOS: Record<string, () => FleetView> = { problems, calm, "hub-down": hubDown, empty, off };
-const param = typeof location !== "undefined" ? new URLSearchParams(location.search).get("fleet") : null;
+const query = typeof location !== "undefined" ? new URLSearchParams(location.search) : null;
+const param = query?.get("fleet") ?? null;
+const release = query?.get("release") ?? "ok";
+const pause = (ms: number) => new Promise((r) => setTimeout(r, ms)); // как настоящий вызов: не мгновенно
+
+// Картина одна на вкладку: снятый замок должен исчезнуть и из списка, и из счётчика проблем.
+let current: FleetView | null = null;
+const listeners = new Set<(v: FleetView) => void>();
+
+function scene(): FleetView {
+  const v = (SCENARIOS[param ?? ""] ?? problems)();
+  return release === "no-dispatcher" ? { ...v, local: { ...v.local, releaseError: "не найден node — запустить диспетчер нечем" } } : v;
+}
 
 export async function getFleet(): Promise<FleetView> {
   if (param === "loading") return new Promise(() => {});
-  await new Promise((r) => setTimeout(r, 150)); // как настоящий вызов: не мгновенно
-  return (SCENARIOS[param ?? ""] ?? problems)();
+  await pause(150);
+  return (current ??= scene());
 }
 
-export async function onFleet(_cb: (v: FleetView) => void): Promise<() => void> {
-  return () => {};
+export async function onFleet(cb: (v: FleetView) => void): Promise<() => void> {
+  listeners.add(cb);
+  return () => listeners.delete(cb);
+}
+
+const PID = 48213;
+
+export async function releasePreview(l: FleetLock): Promise<string> {
+  await pause(400);
+  return `Замки:   ${l.resource}(260 мин)\nТалоны:  нет\nПроцессы: 1\n  ${PID}  ${l.command ?? ""}`;
+}
+
+export async function releaseLock(l: FleetLock): Promise<ReleaseResult> {
+  await pause(700);
+  if (release === "refused") return { released: false, message: "хаб отказал в доступе: токен в fleet.json не подходит", output: null };
+  const v = (current ??= scene());
+  const same = (x: FleetLock) => x.scope === l.scope && x.key === l.key && x.session === l.session;
+  current = {
+    ...v,
+    locks: v.locks.filter((x) => !same(x)),
+    fleetResources: v.fleetResources.map((r) => (l.scope === "fleet" && r.name === l.resource ? { ...r, used: 0 } : r)),
+    problems: v.problems - 1,
+  };
+  listeners.forEach((cb) => cb(current!));
+  return { released: true, message: "замок снят", output: l.scope === "local" ? `  убит ${PID}\nЗамки отпущены, талоны сняты, доска очищена.` : null };
 }
