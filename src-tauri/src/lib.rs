@@ -52,6 +52,7 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::check_environment,
+            commands::get_update_blocker,
             commands::open_logs,
             commands::close_logs,
             commands::open_url,
@@ -62,6 +63,7 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                tray::window_hidden(window.app_handle());
                 // Вкладки логов закрылись вместе с окном: `docker logs -f` на серверах не нужен.
                 if let Some(core) = window.try_state::<std::sync::Arc<monitor::Monitor>>() {
                     core.close_all_logs();
@@ -75,6 +77,11 @@ pub fn run() {
                 let data_dir = app.path().app_data_dir()?;
                 app.manage(monitor::Monitor::start(app.handle().clone(), data_dir));
                 app.manage(sources::fleet::Fleet::start(app.handle().clone()));
+                // Автозапуск без окна — сразу фоновое приложение: иначе в Dock мелькнёт значок и останется в Cmd-Tab.
+                #[cfg(target_os = "macos")]
+                if hidden {
+                    app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
                 // Окно создаём сами (в конфиге create: false), чтобы в режиме флагов его не было вовсе.
                 WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
                     .visible(!hidden)
@@ -112,9 +119,14 @@ pub fn run() {
 
 /// Вывод в формате ключ=значение, чтобы скрипт мог разобрать его grep'ом; то же — в лог,
 /// иначе по логу не понять, прошла ли проверка.
-async fn update_cli(app: &AppHandle, apply: bool) -> tauri_plugin_updater::Result<()> {
+async fn update_cli(app: &AppHandle, apply: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let current = app.package_info().version.to_string();
     println!("current={current}");
+    // Во временной копии только для чтения заменять нечего: установка упала бы на замене бандла.
+    // Отказ сразу, а не «когда найдётся обновление»: скрипту нужен один и тот же ответ на этой машине.
+    if let Some(blocker) = update_blocker().filter(|_| apply) {
+        return Err(blocker.into());
+    }
     let update = app.updater()?.check().await?;
     let available = update.as_ref().map_or("", |u| u.version.as_str());
     println!("available={available}");
@@ -134,6 +146,25 @@ async fn update_cli(app: &AppHandle, apply: bool) -> tauri_plugin_updater::Resul
     println!("installed={version}");
     log::info!("обновление: {version} установлена");
     Ok(())
+}
+
+/// Мак запускает приложение с карантином (скопированное `cp -R`, открытое из «Загрузок») из временной
+/// копии только для чтения: `.../AppTranslocation/<UUID>/d/Pult.app`. Заменить её на месте нельзя.
+/// Сравниваем компонент пути целиком, чтобы не принять за копию каталог с похожим именем.
+fn is_translocated(exe: &std::path::Path) -> bool {
+    exe.components().any(|c| c.as_os_str() == "AppTranslocation")
+}
+
+/// Почему обновление не поставить ещё до попытки (`None` — можно пробовать).
+/// Текст один на окно и на `--apply-update`: интерфейс берёт его через команду `get_update_blocker`.
+fn update_blocker() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    (cfg!(target_os = "macos") && is_translocated(&exe)).then(|| {
+        "Пульт запущен из временной копии macOS: так система открывает приложение, скачанное или \
+         скопированное с карантином, — заменить его на месте нельзя. Закрой Пульт, перетащи Pult.app \
+         в «Программы» через Finder (или вынеси из «Программ» и верни обратно) и открой снова."
+            .to_string()
+    })
 }
 
 /// Сырой текст ошибки замены бандла ничего не говорит человеку — добавляем, что делать.
@@ -174,5 +205,13 @@ mod tests {
         assert!(e.starts_with("не удалось заменить приложение"), "{e}");
         assert!(e.ends_with("(failed to rename: Cross-device link (os error 18))"), "{e}");
         assert_eq!(super::explain_update_error("timeout"), "timeout");
+    }
+
+    #[test]
+    fn translocated_path_is_recognized() {
+        let is = |p: &str| super::is_translocated(std::path::Path::new(p));
+        assert!(is("/private/var/folders/ab/cd/T/AppTranslocation/6F1E-77/d/Pult.app/Contents/MacOS/pult"));
+        assert!(!is("/Applications/Pult.app/Contents/MacOS/pult"));
+        assert!(!is("/Users/me/AppTranslocation-notes/Pult.app/Contents/MacOS/pult"));
     }
 }

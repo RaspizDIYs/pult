@@ -4,7 +4,7 @@ import type { useUpdater } from "@/lib/updater";
 
 export function UpdateBanner({ updater }: { updater: ReturnType<typeof useUpdater> }) {
   const [hiddenVersion, setHiddenVersion] = useState<string | null>(null);
-  const { update, installing, install } = updater;
+  const { update, installing, install, installError, blocker } = updater;
   if (!update || update.version === hiddenVersion) return null;
 
   return (
@@ -14,10 +14,19 @@ export function UpdateBanner({ updater }: { updater: ReturnType<typeof useUpdate
         {update.body && (
           <div className="mt-1 whitespace-pre-line text-muted-foreground">{update.body}</div>
         )}
+        {blocker && <p className="mt-1 break-words text-warn-fg">{blocker}</p>}
+        {installError && (
+          <p role="alert" className="mt-1 break-words text-root-fg">
+            Не удалось установить: {installError.text}
+          </p>
+        )}
       </div>
-      <Button size="sm" onClick={install} disabled={installing}>
-        {installing ? "Устанавливаю…" : "Обновить и перезапустить"}
-      </Button>
+      {/* Из временной копии ставить нечего — вместо кнопки текст выше. */}
+      {!blocker && (
+        <Button size="sm" onClick={install} disabled={installing}>
+          {installing ? "Устанавливаю…" : "Обновить и перезапустить"}
+        </Button>
+      )}
       <Button size="sm" variant="ghost" onClick={() => setHiddenVersion(update.version)} disabled={installing}>
         Позже
       </Button>
