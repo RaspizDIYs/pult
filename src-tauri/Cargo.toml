@@ -38,6 +38,10 @@ tokio = { version = "1", features = ["net", "time", "process", "sync", "rt", "io
 # Те же reqwest и rustls, что уже тянет updater: новых крейтов для http-проверок не нужно.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Токен панели задач — в системной связке ключей. Закреплено точно; 3.x, а не 4.x: четвёртая
+# тянет Secret Service для Linux, которого у Пульта нет. Без фич платформ keyring молча
+# берёт хранилище в памяти, поэтому фичи обязательны.
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native"] }
 
 [profile.release]
 strip = true

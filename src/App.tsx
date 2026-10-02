@@ -22,6 +22,7 @@ import { buildGraph, fmtTimeSec, summarize } from "@/lib/model";
 import { errText, isTauri, pult, type NodeState, type NodeView } from "@/lib/pult";
 import { useUpdater } from "@/lib/updater";
 import { useNow, usePult } from "@/lib/use-pult";
+import { TasksScreen } from "@/tasks/tasks-screen";
 
 const NO_NODES: NodeView[] = [];
 const NO_STATES: Record<string, NodeState> = {};
@@ -37,7 +38,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [reveal, setReveal] = useState(0);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [view, setView] = useState<"map" | "fleet">("map");
+  const [view, setView] = useState<"map" | "fleet" | "tasks">("map");
   // Рой слушаем и с карты: число проблем на ярлыке вкладки видно, не переключаясь.
   const fleet = useFleet();
   const fleetProblems = fleet.view?.problems ?? 0;
@@ -143,7 +144,7 @@ export default function App() {
 
   const warnings = inv?.warnings.length ?? 0;
   return (
-    <Tabs value={view} onValueChange={(v) => setView(v as "map" | "fleet")} className="h-screen gap-0">
+    <Tabs value={view} onValueChange={(v) => setView(v as "map" | "fleet" | "tasks")} className="h-screen gap-0">
       <header className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2">
         <h1 className="text-base font-semibold">Пульт</h1>
         <span className="text-xs text-muted-foreground">{version}</span>
@@ -157,6 +158,7 @@ export default function App() {
               </span>
             )}
           </TabsTrigger>
+          <TabsTrigger value="tasks">Задачи</TabsTrigger>
         </TabsList>
         {!isTauri && (
           <span className="rounded-full border border-warn/50 bg-warn-bg px-2 text-[11px] leading-5 text-warn-fg" title="Пульт открыт в браузере без ядра: все данные выдуманные">
@@ -186,7 +188,7 @@ export default function App() {
       </header>
 
       <UpdateBanner updater={updater} />
-      {/* Карта остаётся смонтированной на вкладке роя: иначе при возврате теряется вид и раскладка. */}
+      {/* Обе вкладки остаются смонтированными: карта не теряет вид и раскладку, доска — фильтры. */}
       <TabsContent value="map" forceMount className="flex min-h-0 flex-col text-base data-[state=inactive]:hidden">
         {snapshot && error && (
           <p role="alert" className="border-b bg-warn-bg px-4 py-1.5 text-xs text-warn-fg">
@@ -197,6 +199,9 @@ export default function App() {
       </TabsContent>
       <TabsContent value="fleet" className="flex min-h-0 flex-col text-base">
         <FleetScreen view={fleet.view} error={fleet.error} now={now} />
+      </TabsContent>
+      <TabsContent value="tasks" forceMount className="flex min-h-0 flex-col text-base data-[state=inactive]:hidden">
+        <TasksScreen active={view === "tasks"} now={now} onSettings={() => setSettingsOpen(true)} />
       </TabsContent>
 
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} inventory={inv} updater={updater} version={version} />
