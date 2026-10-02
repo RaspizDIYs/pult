@@ -157,14 +157,26 @@ pub fn stream_logs(
     container: &str,
     tail: u32,
 ) -> Result<LogStream, PlanError> {
+    stream_logs_within(ssh, hops, container, tail, LOG_GRACE)
+}
+
+/// Срок до убийства ssh — параметром ради проверки: тест отличает «удалённая сторона
+/// погасила `docker logs` сама» от «убили по сроку» причинно, а не по секундомеру.
+fn stream_logs_within(
+    ssh: Option<&Path>,
+    hops: &[Hop],
+    container: &str,
+    tail: u32,
+    grace: Duration,
+) -> Result<LogStream, PlanError> {
     let script = logs_script(hops, container, tail)?;
     let cmd = ssh_command(ssh, &hops[0]);
     let (tx, lines) = mpsc::channel(LOG_BUFFER);
-    let done = tokio::spawn(follow(cmd, script, tx));
+    let done = tokio::spawn(follow(cmd, script, tx, grace));
     Ok(LogStream { lines, done })
 }
 
-async fn follow(mut cmd: Command, script: String, tx: mpsc::Sender<String>) -> Result<(), String> {
+async fn follow(mut cmd: Command, script: String, tx: mpsc::Sender<String>, grace: Duration) -> Result<(), String> {
     let mut child = cmd.spawn().map_err(|e| format!("не удалось запустить ssh: {e}"))?;
     let mut stdin = child.stdin.take().expect("piped");
     // stdin не закрываем: его закрытие и есть сигнал отмены для удалённой стороны.
@@ -195,7 +207,7 @@ async fn follow(mut cmd: Command, script: String, tx: mpsc::Sender<String>) -> R
         }
     }
     drop(stdin);
-    let status = match tokio::time::timeout(LOG_GRACE, child.wait()).await {
+    let status = match tokio::time::timeout(grace, child.wait()).await {
         Ok(Ok(status)) => Some(status),
         _ => {
             let _ = child.kill().await;
@@ -313,14 +325,20 @@ esac
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Предел в 5 с — с запасом в разы на то, чтобы подделка успела напечатать секции на
+    /// загруженной машине (с 1 с она не успевала, и проверять было нечего). Причинность — двумя
+    /// границами: не раньше предела (кончилось по нему, а не само) и задолго до 30 с `sleep`
+    /// (процесс действительно убит, а не дожит).
     #[tokio::test]
     async fn time_limit_keeps_complete_sections() {
         let dir = stubs("slow");
         let mut p = plan("slow", "slow-host");
         p.collectors = vec![Collector::Wireguard, Collector::Docker];
+        let limit = Duration::from_secs(5);
         let started = Instant::now();
-        let reports = collect_within(Some(&dir.join("ssh")), &p, Duration::from_secs(1)).await.unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5));
+        let reports = collect_within(Some(&dir.join("ssh")), &p, limit).await.unwrap();
+        let took = started.elapsed();
+        assert!(took >= limit && took < Duration::from_secs(25), "{took:?}");
         assert_eq!(reports[0].ssh, Outcome::Ok(()));
         assert_eq!(reports[0].wireguard, Some(Outcome::Ok(vec![])));
         // Оборванная секция — «не получено», а не пустой список контейнеров.
@@ -336,15 +354,17 @@ esac
             Hop { target: "host-a".into(), key: None },
             Hop { target: "user@host-b".into(), key: Some("/root/.ssh/id_example".into()) },
         ];
-        let mut stream = stream_logs(Some(&ssh), &hops, "app-web-1", 10).unwrap();
+        // Срок до убийства — минута: если бы удалённая сторона не гасила docker logs по EOF,
+        // отмена длилась бы минуту, а не секунды, и это видно при любой нагрузке машины.
+        let grace = Duration::from_secs(60);
+        let mut stream = stream_logs_within(Some(&ssh), &hops, "app-web-1", 10, grace).unwrap();
         let mut got = vec![stream.lines.recv().await.unwrap(), stream.lines.recv().await.unwrap()];
         got.sort();
         assert_eq!(got, ["вторая строка", "первая строка"]);
-        // Отмена: удалённая сторона сама гасит docker logs по EOF, без убийства через LOG_GRACE.
         let started = Instant::now();
         drop(stream.lines);
         assert_eq!(stream.done.await.unwrap(), Ok(()));
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(started.elapsed() < grace / 2, "ssh убит по сроку, а не завершился сам: {:?}", started.elapsed());
 
         // docker logs завершился сам: поток кончается, а не висит до закрытия вкладки.
         let mut stream = stream_logs(Some(&ssh), &hops[..1], "missing", 10).unwrap();
@@ -360,12 +380,20 @@ esac
     async fn readers_are_stopped_when_ssh_exits_but_stdout_stays_open() {
         let dir = stubs("persist");
         let p = plan("хост", "persist-host");
-        let _ = collect_within(Some(&dir.join("ssh")), &p, Duration::from_secs(2)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // ssh здесь выходит сам; предел щедрый, чтобы на загруженной машине он не убил подделку
+        // раньше, чем та запишет pid писателя.
+        let _ = collect_within(Some(&dir.join("ssh")), &p, Duration::from_secs(30)).await.unwrap();
         let pid = std::fs::read_to_string(dir.join("persist.pid")).unwrap().trim().to_owned();
-        let alive = std::process::Command::new("kill").args(["-0", &pid]).status().unwrap().success();
+        // Писатель умирает от SIGPIPE на первой записи после того, как мы закрыли свой конец.
+        // Ждём этого, а не фиксированные 800 мс: живой через 20 с — значит, конец не закрыт.
+        let alive = || std::process::Command::new("kill").args(["-0", &pid]).status().unwrap().success();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while alive() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let still = alive();
         let _ = std::process::Command::new("kill").arg(&pid).status();
-        assert!(!alive, "наш конец канала ещё открыт: писатель жив");
+        assert!(!still, "наш конец канала ещё открыт: писатель жив");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

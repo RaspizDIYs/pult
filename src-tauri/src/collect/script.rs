@@ -12,6 +12,9 @@ const NESTED_LIMIT_SECS: u32 = 15;
 ///   к зависшему хосту съел бы общие 45 секунд. Фоновой команде sh подменяет stdin на /dev/null,
 ///   поэтому вход (скрипт вложенного хоста) передаётся явно через fd 4; сторож отвязан от всех
 ///   каналов, иначе подстановка `$(…)` ждала бы и его. Сработавший сторож — код 124, как у `timeout`.
+///   Сработал ли он, узнаём по его собственному коду выхода (3), а не по тому, жив ли он ещё: под
+///   нагрузкой сторож, уже убивший команду, живёт ещё мгновение, и таймаут выглядел как «убит
+///   сигналом» (код 143) — проверка порта показывала «Terminated: 15» вместо «таймаут».
 /// - `pult_sec` — секция печатается одним `printf` уже после команды: код выхода известен только
 ///   в конце, а одна запись не перемешивается с параллельными проверками.
 /// - `docker ps` только перечисляет id: его `{{json .}}` отдаёт команду запуска, монтирования и все
@@ -29,11 +32,13 @@ pult_t() {
   _l=$1; shift
   if [ -n "$pult_tm" ]; then timeout "$_l" "$@"; return; fi
   { "$@" <&4 4<&- & _p=$!
-    ( trap 'kill $! 2>/dev/null; exit 0' TERM; sleep "$_l" & wait $!; kill "$_p" 2>/dev/null ) </dev/null >/dev/null 2>&1 4<&- &
+    ( _f=; trap 'kill $! 2>/dev/null; [ -n "$_f" ] && exit 3; exit 0' TERM
+      sleep "$_l" & wait $!; _f=1; kill "$_p" 2>/dev/null; exit 3 ) </dev/null >/dev/null 2>&1 4<&- &
     _w=$!
     wait "$_p"; _r=$?
-    if kill "$_w" 2>/dev/null; then return $_r; fi
-    return 124; } 4<&0
+    kill "$_w" 2>/dev/null; wait "$_w"
+    if [ $? -eq 3 ]; then return 124; fi
+    return $_r; } 4<&0
 }
 pult_sec() {
   _h=$1; _s=$2; shift 2
@@ -325,12 +330,19 @@ mod tests {
     }
 
     /// Находка ревью 2: без совместимого `timeout` предел не действовал вовсе.
+    ///
+    /// Проверяем причину, а не часы: код 124 говорит, что сработал именно сторож, а то, что
+    /// `sleep 30` не дожили до конца, — что команду он действительно убил (`output()` ждёт
+    /// закрытия stdout, а его держит `sleep`). Двадцать секунд запаса на загруженную машину.
     #[cfg(unix)]
     #[test]
     fn limit_holds_without_timeout_and_nested_ssh_has_keepalive() {
-        let (out, took) = run_sh("pult_t 1 sleep 4; echo \"rc=$?\"", &[("timeout", "#!/bin/sh\nexit 1\n")]);
-        assert!(took < std::time::Duration::from_secs(3), "предел не сработал: {took:?}");
-        assert!(out.contains("rc=124"), "{out}");
+        let (out, took) = run_sh("pult_t 1 sleep 30; echo \"rc=$?\"", &[("timeout", "#!/bin/sh\nexit 1\n")]);
+        assert!(out.contains("rc=124"), "сработал не сторож: {out}");
+        assert!(took < std::time::Duration::from_secs(20), "команда дожила до своего конца: {took:?}");
+        // И обратное: команда, закончившая сама, отдаёт свой код, а не 124.
+        let (out, _) = run_sh("pult_t 30 sh -c 'exit 7'; echo \"rc=$?\"", &[("timeout", "#!/bin/sh\nexit 1\n")]);
+        assert!(out.contains("rc=7"), "{out}");
         let mut p = host("хост-а", "user@10.0.0.2");
         p.nested = vec![host("хост-б", "user@10.0.0.4")];
         let s = build_script(&p).unwrap();
@@ -345,7 +357,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let fake_nc = "#!/bin/sh\necho 'usage: nc [-46DdhklnrStUuv] [-i interval] [-p source_port]' >&2\nexit 1\n";
-        let (out, _) = run_sh(&format!("pult_tcp 127.0.0.1 {port} 2; echo \"rc=$?\""), &[("nc", fake_nc)]);
+        // Предел пробы щедрый: запасной путь — это запуск bash, а на загруженной машине он не
+        // укладывался в 2 секунды, и проба честно кончалась таймаутом вместо ответа о порте.
+        let (out, _) = run_sh(&format!("pult_tcp 127.0.0.1 {port} 20; echo \"rc=$?\""), &[("nc", fake_nc)]);
         // Либо запасной путь установил соединение, либо проба честно не состоялась (код ≠ 0).
         assert!(out.contains("@tcp 0") || !out.contains("rc=0"), "{out}");
         drop(listener);
