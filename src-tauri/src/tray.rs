@@ -1,8 +1,10 @@
 //! Значок в трее: сводка в подсказке, меню, другой вид при корневых отказах.
-//! Окно при закрытии прячется, а проверки идут дальше — выход только из меню.
+//! Окно при закрытии прячется, а проверки идут дальше — выход только из меню (на маке ещё Cmd+Q).
 
 use crate::monitor::Monitor;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -40,13 +42,46 @@ pub fn update(app: &AppHandle, roots: usize) {
     }
 }
 
+/// Окно показано (трей, Dock, повторный запуск). Приложение без окна — Accessory, его надо
+/// вернуть в Regular раньше, чем окно: иначе оно покажется без значка в Dock и без меню.
 pub fn show_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    set_policy(app, tauri::ActivationPolicy::Regular);
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
 }
+
+#[cfg(target_os = "macos")]
+fn set_policy(app: &AppHandle, policy: tauri::ActivationPolicy) {
+    if let Err(e) = app.set_activation_policy(policy) {
+        log::warn!("режим приложения не переключился: {e}");
+    }
+}
+
+/// Окно спрятано крестиком. На маке приложение без окна уходит из Dock и Cmd-Tab: иначе оно
+/// остаётся там «открытым», а Cmd-Tab делает его активным без окна (`Reopen` при этом не
+/// приходит). Живёт значком в строке меню; первый раз за запуск говорим об этом, иначе
+/// непонятно, почему процесс остался. На винде окно просто прячется в трей, как раньше.
+#[cfg(target_os = "macos")]
+pub fn window_hidden(app: &AppHandle) {
+    set_policy(app, tauri::ActivationPolicy::Accessory);
+    static HINTED: AtomicBool = AtomicBool::new(false);
+    if app.state::<Arc<Monitor>>().settings().notifications && !HINTED.swap(true, Ordering::Relaxed) {
+        crate::notify::send(
+            app,
+            vec![crate::notify::Alert {
+                title: "Пульт продолжает проверять в фоне".into(),
+                body: "Значок в строке меню, выход там же.".into(),
+            }],
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn window_hidden(_app: &AppHandle) {}
 
 /// Значок приложения; при отказе — с красной точкой в углу. Рисуем сами, чтобы не
 /// держать второй файл значка, который разойдётся с основным.

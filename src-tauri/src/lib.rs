@@ -63,6 +63,7 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                tray::window_hidden(window.app_handle());
                 // Вкладки логов закрылись вместе с окном: `docker logs -f` на серверах не нужен.
                 if let Some(core) = window.try_state::<std::sync::Arc<monitor::Monitor>>() {
                     core.close_all_logs();
@@ -76,6 +77,11 @@ pub fn run() {
                 let data_dir = app.path().app_data_dir()?;
                 app.manage(monitor::Monitor::start(app.handle().clone(), data_dir));
                 app.manage(sources::fleet::Fleet::start(app.handle().clone()));
+                // Автозапуск без окна — сразу фоновое приложение: иначе в Dock мелькнёт значок и останется в Cmd-Tab.
+                #[cfg(target_os = "macos")]
+                if hidden {
+                    app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
                 // Окно создаём сами (в конфиге create: false), чтобы в режиме флагов его не было вовсе.
                 WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
                     .visible(!hidden)
