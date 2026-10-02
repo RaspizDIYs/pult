@@ -46,6 +46,7 @@ export interface NodeView {
   title: string;
   kind: string;
   group: string | null;
+  project: string | null;
   on: string | null;
   dependsOn: string[];
   access: { how: string | null; secret: string | null; who: string[] } | null;

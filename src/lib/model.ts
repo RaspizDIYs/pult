@@ -27,9 +27,9 @@ interface ToneStyle {
   Icon: LucideIcon;
   /** Плашка: фон, текст и рамка из токенов состояния (index.css). */
   chip: string;
-  /** Карточка узла на карте. */
+  /** Карточка площадки на карте. */
   card: string;
-  /** Цвет связи, ведущей к узлу. */
+  /** Цвет пунктира к узлу, когда выбран связанный с ним. */
   stroke: string;
   /** Заливка точки в легенде и в полосе сводки. */
   dot: string;
@@ -189,25 +189,6 @@ export function dependentsOf(g: Graph, id: string): Set<string> {
     stack.push(...(g.children.get(cur) ?? []));
   }
   return seen;
-}
-
-export interface Edge {
-  id: string;
-  source: string;
-  target: string;
-  /** `on` — размещён на узле, `dep` — зависит от. */
-  via: "on" | "dep";
-}
-
-export function buildEdges(nodes: NodeView[]): Edge[] {
-  const ids = new Set(nodes.map((n) => n.id));
-  const edges: Edge[] = [];
-  for (const n of nodes) {
-    if (n.on && ids.has(n.on) && n.on !== n.id) edges.push({ id: `${n.on}>${n.id}:on`, source: n.on, target: n.id, via: "on" });
-    for (const d of n.dependsOn)
-      if (ids.has(d) && d !== n.id && d !== n.on) edges.push({ id: `${d}>${n.id}:dep`, source: d, target: n.id, via: "dep" });
-  }
-  return edges;
 }
 
 // ───────────── Сводка ─────────────
