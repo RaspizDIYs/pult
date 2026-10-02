@@ -243,8 +243,9 @@ done
 target=$1; shift
 case $target in
   *down*) echo "ssh: connect to host $target port 22: Connection timed out" >&2; exit 255 ;;
+  # Метка «напечатал» — после printf: с ней тест знает, что секции уже лежали в канале до предела.
   *slow*) printf '@@pult 1 host=slow section=wireguard rc=0\n100\n@ips\n@@pult 1 host=slow section=docker rc=0\n{"name":'
-          exec sleep 30 ;;
+          : > "${0%/*}/printed"; exec sleep 300 ;;
   # ssh уже вышел, а потомок (как мастер ControlPersist) держит его stdout и пишет в него.
   *persist*) ( while :; do echo x; sleep 0.1; done ) & echo $! > "$(dirname "$0")/persist.pid"; exit 0 ;;
 esac
@@ -325,25 +326,34 @@ esac
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Предел в 5 с — с запасом в разы на то, чтобы подделка успела напечатать секции на
-    /// загруженной машине (с 1 с она не успевала, и проверять было нечего). Причинность — двумя
-    /// границами: не раньше предела (кончилось по нему, а не само) и задолго до 30 с `sleep`
-    /// (процесс действительно убит, а не дожит).
+    /// Причинность вместо секундомера. Подделка печатает секции и ставит метку; есть метка —
+    /// секции лежали в канале до предела, и проверка строгая. Нет метки — машина так занята,
+    /// что подделка не успела сказать ни слова, проверять нечего: пробуем с пределом больше.
+    /// Сломанная реализация (выброс полученного по пределу) не пройдёт ни с каким пределом.
+    /// Границы времени: не раньше предела (кончилось по нему, а не само) и задолго до 300 с
+    /// `sleep` (процесс действительно убит, а не дожит).
     #[tokio::test]
     async fn time_limit_keeps_complete_sections() {
         let dir = stubs("slow");
         let mut p = plan("slow", "slow-host");
         p.collectors = vec![Collector::Wireguard, Collector::Docker];
-        let limit = Duration::from_secs(5);
-        let started = Instant::now();
-        let reports = collect_within(Some(&dir.join("ssh")), &p, limit).await.unwrap();
-        let took = started.elapsed();
-        assert!(took >= limit && took < Duration::from_secs(25), "{took:?}");
-        assert_eq!(reports[0].ssh, Outcome::Ok(()));
-        assert_eq!(reports[0].wireguard, Some(Outcome::Ok(vec![])));
-        // Оборванная секция — «не получено», а не пустой список контейнеров.
-        assert_eq!(reports[0].docker, Some(Outcome::Missing));
-        let _ = std::fs::remove_dir_all(dir);
+        for limit in [5, 15, 45].map(Duration::from_secs) {
+            let _ = std::fs::remove_file(dir.join("printed"));
+            let started = Instant::now();
+            let reports = collect_within(Some(&dir.join("ssh")), &p, limit).await.unwrap();
+            let took = started.elapsed();
+            if !dir.join("printed").exists() {
+                continue;
+            }
+            assert!(took >= limit && took < limit + Duration::from_secs(30), "{took:?}");
+            assert_eq!(reports[0].ssh, Outcome::Ok(()));
+            assert_eq!(reports[0].wireguard, Some(Outcome::Ok(vec![])));
+            // Оборванная секция — «не получено», а не пустой список контейнеров.
+            assert_eq!(reports[0].docker, Some(Outcome::Missing));
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        panic!("подделка ssh не успела напечатать секции даже за 45 с — машина перегружена, проверка не состоялась");
     }
 
     #[tokio::test]
