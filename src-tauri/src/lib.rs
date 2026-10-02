@@ -79,6 +79,8 @@ pub fn run() {
             commands::close_logs,
             commands::open_url,
             sources::fleet::get_fleet,
+            sources::fleet::fleet_release_preview,
+            sources::fleet::fleet_release_lock,
         ])
         .on_window_event(|window, event| {
             // Закрытие окна только прячет его: проверки и трей работают дальше, выход — из меню трея.

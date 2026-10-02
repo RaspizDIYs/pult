@@ -97,8 +97,14 @@ export interface FleetView {
   claims: FleetClaim[];
   board: FleetNote[];
   tasks: FleetTask[];
-  local: { dir: string; found: boolean; resources: FleetResource[]; runs: FleetRun[]; errors: string[] };
+  local: { dir: string; found: boolean; resources: FleetResource[]; runs: FleetRun[]; errors: string[]; releaseError: string | null };
   problems: number;
+}
+
+export interface ReleaseResult {
+  released: boolean;
+  message: string;
+  output: string | null;
 }
 
 const mock = () => import("./fleet-mock");
@@ -109,6 +115,16 @@ export async function getFleet(): Promise<FleetView> {
 
 async function onFleet(cb: (v: FleetView) => void): Promise<() => void> {
   return isTauri ? listen<FleetView>("pult://fleet", (e) => cb(e.payload)) : (await mock()).onFleet(cb);
+}
+
+/** Сухой прогон диспетчера: что он знает о держателе локального замка и какие процессы погасит. */
+export async function releasePreview(l: FleetLock): Promise<string> {
+  return isTauri ? invoke<string>("fleet_release_preview", { key: l.key, session: l.session }) : (await mock()).releasePreview(l);
+}
+
+/** Снять проблемный замок. Итог — по перечитанному состоянию: «снят» значит, что его там больше нет. */
+export async function releaseLock(l: FleetLock): Promise<ReleaseResult> {
+  return isTauri ? invoke<ReleaseResult>("fleet_release_lock", { scope: l.scope, key: l.key, session: l.session }) : (await mock()).releaseLock(l);
 }
 
 /** Снимок роя плюс поток изменений. Подписываемся раньше, чем просим снимок, чтобы не пропустить событие между ними. */

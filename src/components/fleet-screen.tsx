@@ -1,11 +1,15 @@
 import { CircleCheck, CircleHelp, CircleX, FileWarning, LoaderCircle, PlugZap, Unplug } from "lucide-react";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ago, fmtDuration, fmtTime, plural } from "@/lib/model";
 import {
   folder,
   isService,
   presenceText,
   problemText,
+  releaseLock,
+  releasePreview,
   sessionTitle,
   shortId,
   TASK_LABEL,
@@ -15,20 +19,29 @@ import {
   type FleetSession,
   type FleetTask,
   type FleetView,
+  type ReleaseResult,
   type TaskStatus,
 } from "@/lib/fleet";
+import { errText } from "@/lib/pult";
 import { cn } from "@/lib/utils";
 
 // Экран роя отвечает на три вопроса, и именно в таком порядке: есть ли беда (замок на
 // ушедшей сессии, двое в одном файле), кто в сети и что держит, что происходит дальше.
 
 type Lookup = (id: string) => FleetSession | undefined;
+type OnRelease = (l: FleetLock) => void;
+
+function lookup(view: FleetView | null): Lookup {
+  const m = new Map(view?.sessions.map((s) => [s.id, s]) ?? []);
+  return (id) => m.get(id);
+}
 
 export function FleetScreen({ view, error, now }: { view: FleetView | null; error: string | null; now: number }) {
-  const byId = useMemo(() => {
-    const m = new Map(view?.sessions.map((s) => [s.id, s]) ?? []);
-    return (id: string) => m.get(id);
-  }, [view]);
+  const byId = useMemo(() => lookup(view), [view]);
+  // Диалог держит картину на момент нажатия: после снятия замок и его держатель из живой
+  // картины пропадут, а в итоге всё равно должно быть сказано, чей замок сняли.
+  const [releasing, setReleasing] = useState<{ lock: FleetLock; view: FleetView } | null>(null);
+  const onRelease: OnRelease = (lock) => view && setReleasing({ lock, view });
 
   if (!view) {
     return error ? (
@@ -48,7 +61,7 @@ export function FleetScreen({ view, error, now }: { view: FleetView | null; erro
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
-      <FleetSummary view={view} byId={byId} now={now} />
+      <FleetSummary view={view} byId={byId} now={now} onRelease={onRelease} />
       {/* Две колонки с постоянным составом: «кто» слева, «что держат и что идёт» справа. */}
       <div className="grid items-start gap-x-8 gap-y-6 px-4 py-4 lg:grid-cols-2">
         <div className="min-w-0 space-y-6">
@@ -57,18 +70,19 @@ export function FleetScreen({ view, error, now }: { view: FleetView | null; erro
           <Claims claims={view.claims} byId={byId} now={now} />
         </div>
         <div className="min-w-0 space-y-6">
-          <Locks view={view} byId={byId} now={now} />
+          <Locks view={view} byId={byId} now={now} onRelease={onRelease} />
           <Machine view={view} byId={byId} now={now} />
           <Tasks tasks={view.tasks} hubOk={view.hub.state === "ok"} byId={byId} now={now} />
         </div>
       </div>
+      {releasing && <ReleaseDialog lock={releasing.lock} view={releasing.view} now={now} onClose={() => setReleasing(null)} />}
     </div>
   );
 }
 
 // ───────────── Итог и проблемы ─────────────
 
-function FleetSummary({ view, byId, now }: { view: FleetView; byId: Lookup; now: number }) {
+function FleetSummary({ view, byId, now, onRelease }: { view: FleetView; byId: Lookup; now: number; onRelease: OnRelease }) {
   const chats = view.sessions.filter((s) => s.presence === "online" && !isService(s.id));
   const machines = new Set(chats.map((s) => s.machine ?? "?")).size;
   const lockProblems = view.locks.filter((l) => l.problem);
@@ -114,6 +128,7 @@ function FleetSummary({ view, byId, now }: { view: FleetView; byId: Lookup; now:
                     из-за этого ждут: <RefList ids={l.queue.map((q) => q.session)} byId={byId} now={now} />
                   </p>
                 )}
+                <ReleaseButton l={l} view={view} onRelease={onRelease} className="mt-1" />
               </li>
             ))}
             {overlaps.map((c) => (
@@ -306,7 +321,164 @@ function ScopeTag({ scope }: { scope: FleetLock["scope"] }) {
   );
 }
 
-function Locks({ view, byId, now }: { view: FleetView; byId: Lookup; now: number }) {
+/** Кнопка есть только у замка, который уже считается проблемой: здоровый отсюда не снять вовсе. */
+function ReleaseButton({ l, view, onRelease, className }: { l: FleetLock; view: FleetView; onRelease: OnRelease; className?: string }) {
+  if (!l.problem || !l.session) return null;
+  // Локальный замок снимает диспетчер машины; нет его или node — кнопка говорит, чего не хватает.
+  const blocked = l.scope === "local" ? view.local.releaseError : null;
+  return (
+    <p className={cn("flex flex-wrap items-center gap-x-2 gap-y-0.5", className)}>
+      <Button size="xs" variant="outline" className="text-foreground" disabled={!!blocked} onClick={() => onRelease(l)}>
+        Снять замок…
+      </Button>
+      {blocked && <span className="text-[11px]">Отсюда не снять: {blocked}.</span>}
+    </p>
+  );
+}
+
+function ReleaseDialog({ lock: l, view, now, onClose }: { lock: FleetLock; view: FleetView; now: number; onClose: () => void }) {
+  const byId = useMemo(() => lookup(view), [view]);
+  const holder = byId(l.session!);
+  const local = l.scope === "local";
+  // Сухой прогон диспетчера: null — ещё идёт. Общему замку он не нужен.
+  const [preview, setPreview] = useState<{ text?: string; error?: string } | null>(local ? null : {});
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ReleaseResult | null>(null);
+
+  useEffect(() => {
+    if (!local) return;
+    let dead = false;
+    releasePreview(l).then(
+      (text) => !dead && setPreview({ text }),
+      (e) => !dead && setPreview({ error: errText(e) }),
+    );
+    return () => {
+      dead = true;
+    };
+  }, [l, local]);
+
+  const run = async () => {
+    setBusy(true);
+    try {
+      setResult(await releaseLock(l));
+    } catch (e) {
+      setResult({ released: false, message: errText(e), output: null });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && !busy && onClose()}>
+      <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-lg" showCloseButton={!busy}>
+        <DialogHeader>
+          <DialogTitle>{result ? `Замок ${l.resource} ${result.released ? "снят" : "не снят"}` : `Снять замок ${l.resource}?`}</DialogTitle>
+          <DialogDescription>
+            {local ? "Замок этой машины — его снимет локальный диспетчер." : "Общий замок роя — его снимет хаб, для всех машин сразу."}
+          </DialogDescription>
+        </DialogHeader>
+
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm [&>dt]:text-muted-foreground">
+          <dt>Ресурс</dt>
+          <dd>
+            <span className="font-semibold">{l.resource}</span>
+            {l.repo && ` · ${l.repo}`}
+          </dd>
+          <dt>Держит</dt>
+          <dd>
+            <SessionRef id={l.session!} byId={byId} now={now} />
+            {holder?.name && <code className="ml-1 font-mono text-[11px] text-muted-foreground">{shortId(l.session!)}</code>}
+            {holder?.machine && ` · ${holder.machine}`}
+          </dd>
+          <dt>Сколько</dt>
+          <dd>
+            {l.since ? fmtDuration(now - new Date(l.since).getTime()) : "—"}
+            {l.ttlMin ? ` при сроке ${l.ttlMin} мин` : ""}
+          </dd>
+          <dt>Проблема</dt>
+          <dd className="text-root-fg">{problemText(l, holder, now)}</dd>
+          <dt>Ждут</dt>
+          <dd>{l.queue.length ? <RefList ids={l.queue.map((q) => q.session)} byId={byId} now={now} /> : "никто"}</dd>
+          {l.command && (
+            <>
+              <dt>Команда</dt>
+              <dd className="font-mono text-xs break-all">{l.command}</dd>
+            </>
+          )}
+        </dl>
+
+        {result ? (
+          <div
+            role={result.released ? "status" : "alert"}
+            className={cn("rounded-md border px-3 py-2 text-sm", result.released ? "border-ok/40 bg-ok-bg text-ok-fg" : "border-root/50 bg-root-bg text-root-fg")}
+          >
+            <p className="flex items-start gap-1.5 font-medium">
+              {result.released ? <CircleCheck className="mt-0.5 size-4 shrink-0" aria-hidden /> : <CircleX className="mt-0.5 size-4 shrink-0" aria-hidden />}
+              <span className="min-w-0 break-words">
+                {result.released ? `${result.message[0].toUpperCase()}${result.message.slice(1)}.` : `Замок не снят: ${result.message}`}
+              </span>
+            </p>
+            {result.output && <pre className="mt-1 font-mono text-[11px] whitespace-pre-wrap">{result.output}</pre>}
+          </div>
+        ) : (
+          <>
+            <div className="rounded-md border border-warn/50 bg-warn-bg px-3 py-2 text-sm text-warn-fg">
+              {local ? (
+                <p>
+                  Диспетчер завершит сессию держателя на этой машине целиком: погасит её процессы, снимет <strong>все</strong> её замки и талоны, уберёт её
+                  заметку с доски и заявки на файлы, отметит её ушедшей на хабе.
+                </p>
+              ) : (
+                <p>
+                  Хаб сбросит замок принудительно{l.queue.length ? ", и его возьмёт первый в очереди" : ""}. Процессы держателя на его машине Пульт не трогает: если{" "}
+                  {l.resource} там ещё идёт, он продолжится уже без замка.
+                </p>
+              )}
+              {holder?.presence === "online" && <p className="mt-1 font-medium">Держатель в сети и, возможно, ещё работает. Снимай, только если уверен, что он завис.</p>}
+            </div>
+            {local && (
+              <div className="text-sm">
+                <p className="mb-1 text-muted-foreground">Что диспетчер знает об этой сессии — процессы из списка будут погашены:</p>
+                {preview === null ? (
+                  <p className="flex items-center gap-1.5 text-xs text-muted-foreground" role="status">
+                    <LoaderCircle className="size-3.5 animate-spin" aria-hidden /> Спрашиваю диспетчер…
+                  </p>
+                ) : preview.error ? (
+                  <p role="alert" className="rounded-md border border-root/50 bg-root-bg px-2.5 py-1.5 text-xs text-root-fg">
+                    Диспетчер не ответил, снимать нечем: {preview.error}
+                  </p>
+                ) : (
+                  <pre className="max-h-40 overflow-auto rounded-md border bg-muted/40 px-2.5 py-1.5 font-mono text-[11px] whitespace-pre-wrap">{preview.text}</pre>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        <DialogFooter>
+          {result ? (
+            <Button variant="outline" onClick={onClose}>
+              Закрыть
+            </Button>
+          ) : (
+            <>
+              {/* «Отмена» первой в разметке: на неё встаёт фокус при открытии, и Enter ничего не снимает. */}
+              <Button variant="outline" autoFocus onClick={onClose} disabled={busy}>
+                Отмена
+              </Button>
+              <Button variant="destructive" onClick={() => void run()} disabled={busy || (local && preview?.text === undefined)}>
+                {busy && <LoaderCircle className="animate-spin" aria-hidden />}
+                {busy ? "Снимаю…" : "Снять замок"}
+              </Button>
+            </>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function Locks({ view, byId, now, onRelease }: { view: FleetView; byId: Lookup; now: number; onRelease: OnRelease }) {
   return (
     <Section title="Замки" note="Общие (хаб) — одни на все машины; остальные — ёмкость и ресурсы этой машины.">
       {view.fleetResources.length > 0 && (
@@ -327,7 +499,7 @@ function Locks({ view, byId, now }: { view: FleetView; byId: Lookup; now: number
       ) : (
         <ul className="space-y-1.5">
           {view.locks.map((l) => (
-            <LockRow key={`${l.scope}:${l.key}:${l.session}`} l={l} byId={byId} now={now} />
+            <LockRow key={`${l.scope}:${l.key}:${l.session}`} l={l} view={view} byId={byId} now={now} onRelease={onRelease} />
           ))}
         </ul>
       )}
@@ -335,7 +507,7 @@ function Locks({ view, byId, now }: { view: FleetView; byId: Lookup; now: number
   );
 }
 
-function LockRow({ l, byId, now }: { l: FleetLock; byId: Lookup; now: number }) {
+function LockRow({ l, view, byId, now, onRelease }: { l: FleetLock; view: FleetView; byId: Lookup; now: number; onRelease: OnRelease }) {
   const held = l.since ? now - new Date(l.since).getTime() : null;
   return (
     <li className={cn("rounded-md border px-2.5 py-1.5", l.problem && "border-root/50 bg-root-bg/60")}>
@@ -374,6 +546,7 @@ function LockRow({ l, byId, now }: { l: FleetLock; byId: Lookup; now: number }) 
           ))}
         </p>
       )}
+      <ReleaseButton l={l} view={view} onRelease={onRelease} className="mt-1 text-muted-foreground" />
     </li>
   );
 }
