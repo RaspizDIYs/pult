@@ -187,7 +187,7 @@ function InventoryState({ inv }: { inv: InventoryInfo | null }) {
 }
 
 function UpdatesBlock({ updater, version }: { updater: ReturnType<typeof useUpdater>; version: string }) {
-  const { update, checkedAt, error } = updater;
+  const { update, checkedAt, error, installError, blocker } = updater;
   const when = checkedAt ? fmtTime(checkedAt.toISOString()) : "";
   const status = !isTauri
     ? "обновления проверяются только в самом приложении, не в браузере."
@@ -195,9 +195,11 @@ function UpdatesBlock({ updater, version }: { updater: ReturnType<typeof useUpda
     ? "проверяю…"
     : error
       ? `не удалось проверить (${when}): ${error}`
-      : update
-        ? `доступна ${update.version} (проверено в ${when})`
-        : `установлена последняя (проверено в ${when})`;
+      : installError
+        ? `не удалось установить (${fmtTime(installError.at.toISOString())}): ${installError.text}`
+        : update
+          ? `доступна ${update.version} (проверено в ${when})`
+          : `установлена последняя (проверено в ${when})`;
   return (
     <section className="space-y-2">
       <h3 className="text-sm font-semibold">Обновления</h3>
@@ -205,10 +207,13 @@ function UpdatesBlock({ updater, version }: { updater: ReturnType<typeof useUpda
         <span className="min-w-0 flex-1 break-words text-muted-foreground">
           <span className="text-foreground">Версия {version}.</span> {status}
         </span>
-        <Button size="sm" variant="outline" onClick={updater.runCheck} disabled={!isTauri}>
+        <Button size="sm" variant="outline" onClick={() => void updater.runCheck()} disabled={!isTauri}>
           Проверить сейчас
         </Button>
       </div>
+      {blocker && (
+        <p className="rounded-md border border-warn/50 bg-warn-bg px-2.5 py-1.5 text-xs break-words text-warn-fg">{blocker}</p>
+      )}
     </section>
   );
 }

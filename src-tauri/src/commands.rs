@@ -194,6 +194,13 @@ pub fn check_environment(core: Core<'_>) -> Vec<EnvCheck> {
     core.check_environment()
 }
 
+/// Текст «почему обновление не поставить» или `None`, если можно. Решает ядро: интерфейс
+/// не знает, из какого пути запущен.
+#[tauri::command]
+pub fn get_update_blocker() -> Option<String> {
+    crate::update_blocker()
+}
+
 /// Асинхронная: поток логов запускается задачами tokio, а синхронные команды идут
 /// на главном потоке, вне рантайма.
 #[tauri::command]
