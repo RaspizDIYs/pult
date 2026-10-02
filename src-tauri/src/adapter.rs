@@ -197,6 +197,8 @@ pub fn undeclared(inv: &Inventory, facts: &Facts) -> Vec<Node> {
                 title: container.name.clone(),
                 kind: NodeKind::Container,
                 group: host.group.clone(),
+                project: None,
+                hidden: false,
                 on: Some(host.id.clone()),
                 depends_on: Vec::new(),
                 checks: Vec::new(),

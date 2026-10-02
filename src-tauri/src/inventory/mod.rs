@@ -29,6 +29,13 @@ pub struct Node {
     pub kind: NodeKind,
     #[serde(rename = "группа", default)]
     pub group: Option<String>,
+    /// Проект, к которому относится сервис: на карте сервисы хоста разложены по папкам проектов.
+    #[serde(rename = "проект", default)]
+    pub project: Option<String>,
+    /// Описан и проверяется, но на карту не выводится: служебное, чьё «работает» никому не нужно
+    /// (заглушка «сайт обновляется»). Описан — значит и не «не описан».
+    #[serde(rename = "скрыть", default)]
+    pub hidden: bool,
     #[serde(rename = "на", default)]
     pub on: Option<String>,
     #[serde(rename = "зависит_от", default)]
@@ -411,6 +418,17 @@ mod tests {
         let inv = check(GOOD).unwrap();
         assert_eq!(inv.nodes.len(), 3);
         assert_eq!(inv.nodes[2].checks[0].expect.as_ref().unwrap().list(), vec![200, 204]);
+    }
+
+    #[test]
+    fn project_and_hidden_are_known_fields() {
+        let (inv, warnings) = parse(
+            "версия_схемы: 1\nузлы:\n  - {id: а, название: А, вид: хост}\n  - {id: б, название: Б, вид: контейнер, на: а, контейнер: b, проект: Сайт, скрыть: true}\n",
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(inv.nodes[1].project.as_deref(), Some("Сайт"));
+        assert!(inv.nodes[1].hidden && !inv.nodes[0].hidden);
     }
 
     #[test]
