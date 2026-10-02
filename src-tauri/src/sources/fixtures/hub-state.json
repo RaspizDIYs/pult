@@ -1,0 +1,333 @@
+{
+ "ok": true,
+ "now": 1768478700000,
+ "locks": [
+  {
+   "key": "shop-1a2b3c4d::deploy",
+   "resource": "deploy",
+   "repo": "shop-1a2b3c4d",
+   "session": "dddd4444-0000-4000-8000-000000000004",
+   "machine": "ноут-б",
+   "command": "./deploy.sh prod",
+   "reason": "",
+   "since": 1768467900000,
+   "ageMin": 180
+  },
+  {
+   "key": "shop-1a2b3c4d::push",
+   "resource": "push",
+   "repo": "shop-1a2b3c4d",
+   "session": "eeee5555-0000-4000-8000-000000000005",
+   "machine": "ноут-б",
+   "command": "git push origin test",
+   "reason": "",
+   "since": 1768478520000,
+   "ageMin": 3
+  },
+  {
+   "key": "pult-9f8e7d6c::db-migrate",
+   "resource": "db-migrate",
+   "repo": "pult-9f8e7d6c",
+   "session": "cccc3333-0000-4000-8000-000000000003",
+   "machine": "дом-пк",
+   "command": "npm run migrate",
+   "reason": "",
+   "since": 1768478460000,
+   "ageMin": 4
+  }
+ ],
+ "queue": {
+  "shop-1a2b3c4d::deploy": [
+   {
+    "session": "aaaa1111-0000-4000-8000-000000000001",
+    "machine": "мак-а",
+    "reason": "выкатить фикс корзины",
+    "at": 1768477980000,
+    "seen": 1768478640000
+   }
+  ]
+ },
+ "board": [
+  {
+   "session": "aaaa1111-0000-4000-8000-000000000001",
+   "machine": "мак-а",
+   "text": "правлю экран роя",
+   "task": "",
+   "cwd": "/work/pult",
+   "at": 1768478580000
+  },
+  {
+   "session": "bbbb2222-0000-4000-8000-000000000002",
+   "machine": "мак-а",
+   "text": "чиню оплату в корзине",
+   "task": "KAN-77",
+   "cwd": "/work/shop",
+   "at": 1768478100000
+  }
+ ],
+ "claims": [
+  {
+   "file": "src/App.tsx",
+   "session": "aaaa1111-0000-4000-8000-000000000001",
+   "machine": "мак-а",
+   "repo": "pult-9f8e7d6c",
+   "at": 1768478400000
+  },
+  {
+   "file": "src/App.tsx",
+   "session": "cccc3333-0000-4000-8000-000000000003",
+   "machine": "дом-пк",
+   "repo": "pult-9f8e7d6c",
+   "at": 1768478220000
+  },
+  {
+   "file": "docs/контракт.md",
+   "session": "aaaa1111-0000-4000-8000-000000000001",
+   "machine": "мак-а",
+   "repo": "pult-9f8e7d6c",
+   "at": 1768478340000
+  },
+  {
+   "file": "docs/контракт.md",
+   "session": "dddd4444-0000-4000-8000-000000000004",
+   "machine": "ноут-б",
+   "repo": "pult-9f8e7d6c",
+   "at": 1768474500000
+  }
+ ],
+ "sessions": [
+  {
+   "session": "aaaa1111-0000-4000-8000-000000000001",
+   "machine": "мак-а",
+   "name": "карта",
+   "address": "мак-а/карта",
+   "idleSec": 40
+  },
+  {
+   "session": "bbbb2222-0000-4000-8000-000000000002",
+   "machine": "мак-а",
+   "name": "",
+   "address": "мак-а/bbbb2222",
+   "idleSec": 360
+  },
+  {
+   "session": "cccc3333-0000-4000-8000-000000000003",
+   "machine": "дом-пк",
+   "name": "Даня",
+   "address": "дом-пк/Даня",
+   "idleSec": 120
+  },
+  {
+   "session": "eeee5555-0000-4000-8000-000000000005",
+   "machine": "ноут-б",
+   "name": "ревью",
+   "address": "ноут-б/ревью",
+   "idleSec": 1800
+  }
+ ],
+ "resources": {
+  "deploy": {
+   "capacity": 1,
+   "ttlMin": 40,
+   "label": "деплой общего окружения"
+  },
+  "push": {
+   "capacity": 1,
+   "ttlMin": 5,
+   "label": "push в общую ветку"
+  },
+  "db-migrate": {
+   "capacity": 1,
+   "ttlMin": 20,
+   "label": "миграции общей БД"
+  },
+  "test-stand": {
+   "capacity": 1,
+   "ttlMin": 30,
+   "label": "тест-стенд целиком (e2e, ресет VM)"
+  }
+ },
+ "tasks": [
+  {
+   "task_id": "TASK-11",
+   "title": "обновить зависимости витрины",
+   "assigned_role": "",
+   "executor": "claude",
+   "model": "sonnet",
+   "effort": "medium",
+   "max_budget_usd": 1.5,
+   "model_tier": "sonnet",
+   "target_node": "",
+   "status": "DONE",
+   "priority": "NORMAL",
+   "locked_files": [],
+   "parent_epic": "",
+   "kan": "",
+   "depends_on": [],
+   "payload": {
+    "instructions": "обновить зависимости витрины",
+    "repository": "",
+    "branch": ""
+   },
+   "attempts": 0,
+   "history": [],
+   "created_at": 1768455360000,
+   "created_by": "aaaa1111-0000-4000-8000-000000000001",
+   "task_protocol": 1,
+   "finished_at": 1768460700000,
+   "note": "готово"
+  },
+  {
+   "task_id": "TASK-12",
+   "title": "перевести отчёт на новую схему",
+   "assigned_role": "",
+   "executor": "claude",
+   "model": "sonnet",
+   "effort": "medium",
+   "max_budget_usd": 1.5,
+   "model_tier": "sonnet",
+   "target_node": "",
+   "status": "DONE",
+   "priority": "NORMAL",
+   "locked_files": [],
+   "parent_epic": "",
+   "kan": "",
+   "depends_on": [],
+   "payload": {
+    "instructions": "перевести отчёт на новую схему",
+    "repository": "",
+    "branch": ""
+   },
+   "attempts": 0,
+   "history": [],
+   "created_at": 1768455420000,
+   "created_by": "aaaa1111-0000-4000-8000-000000000001",
+   "task_protocol": 1,
+   "finished_at": 1768475100000
+  },
+  {
+   "task_id": "TASK-13",
+   "title": "починить гонку в драфте",
+   "assigned_role": "",
+   "executor": "claude",
+   "model": "sonnet",
+   "effort": "medium",
+   "max_budget_usd": 1.5,
+   "model_tier": "sonnet",
+   "target_node": "",
+   "status": "FAILED",
+   "priority": "NORMAL",
+   "locked_files": [],
+   "parent_epic": "",
+   "kan": "",
+   "depends_on": [],
+   "payload": {
+    "instructions": "починить гонку в драфте",
+    "repository": "",
+    "branch": ""
+   },
+   "attempts": 3,
+   "history": [],
+   "created_at": 1768455480000,
+   "created_by": "aaaa1111-0000-4000-8000-000000000001",
+   "task_protocol": 1,
+   "finished_at": 1768473300000,
+   "note": "сессия-исполнитель пропала (попыток 3, дальше — к человеку)"
+  },
+  {
+   "task_id": "TASK-14",
+   "title": "прогнать e2e на тест-стенде",
+   "assigned_role": "",
+   "executor": "claude",
+   "model": "sonnet",
+   "effort": "medium",
+   "max_budget_usd": 1.5,
+   "model_tier": "sonnet",
+   "target_node": "",
+   "status": "IN_PROGRESS",
+   "priority": "NORMAL",
+   "locked_files": [],
+   "parent_epic": "",
+   "kan": "",
+   "depends_on": [],
+   "payload": {
+    "instructions": "прогнать e2e на тест-стенде",
+    "repository": "",
+    "branch": ""
+   },
+   "attempts": 0,
+   "history": [],
+   "created_at": 1768455540000,
+   "created_by": "aaaa1111-0000-4000-8000-000000000001",
+   "task_protocol": 1,
+   "session": "ffff6666-0000-4000-8000-000000000006",
+   "machine": "сервер-сборки",
+   "node": "сборщик",
+   "started_at": 1768477800000
+  },
+  {
+   "task_id": "TASK-15",
+   "title": "переименовать поле статуса",
+   "assigned_role": "",
+   "executor": "claude",
+   "model": "sonnet",
+   "effort": "medium",
+   "max_budget_usd": 1.5,
+   "model_tier": "sonnet",
+   "target_node": "",
+   "status": "TODO",
+   "priority": "NORMAL",
+   "locked_files": [],
+   "parent_epic": "",
+   "kan": "",
+   "depends_on": [],
+   "payload": {
+    "instructions": "переименовать поле статуса",
+    "repository": "",
+    "branch": ""
+   },
+   "attempts": 0,
+   "history": [],
+   "created_at": 1768455600000,
+   "created_by": "aaaa1111-0000-4000-8000-000000000001",
+   "task_protocol": 1
+  },
+  {
+   "task_id": "TASK-16",
+   "title": "починить CSP на витрине",
+   "assigned_role": "",
+   "executor": "claude",
+   "model": "sonnet",
+   "effort": "medium",
+   "max_budget_usd": 1.5,
+   "model_tier": "sonnet",
+   "target_node": "",
+   "status": "TODO",
+   "priority": "HIGH",
+   "locked_files": [],
+   "parent_epic": "",
+   "kan": "",
+   "depends_on": [],
+   "payload": {
+    "instructions": "починить CSP на витрине",
+    "repository": "",
+    "branch": ""
+   },
+   "attempts": 0,
+   "history": [],
+   "created_at": 1768455660000,
+   "created_by": "aaaa1111-0000-4000-8000-000000000001",
+   "task_protocol": 1
+  }
+ ],
+ "attempts": [],
+ "counts": {
+  "sessions": 6,
+  "tasks": 6,
+  "mail": 0,
+  "board": 2,
+  "claims": 4,
+  "locks": 3,
+  "attempts": 0
+ }
+}

@@ -155,7 +155,7 @@ fn chain<'a>(e: &'a (dyn std::error::Error + 'static)) -> impl Iterator<Item = S
 
 /// У reqwest верхний текст ошибки общий («error sending request»), суть — в самом
 /// глубоком источнике: «connection refused», «invalid peer certificate» и т. п.
-fn innermost(e: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn innermost(e: &(dyn std::error::Error + 'static)) -> String {
     chain(e).last().unwrap_or_default()
 }
 

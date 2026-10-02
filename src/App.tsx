@@ -1,6 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { RefreshCw, Settings as SettingsIcon, TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FleetScreen } from "@/components/fleet-screen";
 import { GraphMap } from "@/components/graph-map";
 import { NodePanel } from "@/components/node-panel";
 import {
@@ -14,7 +15,9 @@ import {
 import { SettingsDialog } from "@/components/settings-dialog";
 import { Summary } from "@/components/summary";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { UpdateBanner } from "@/components/update-banner";
+import { useFleet } from "@/lib/fleet";
 import { buildGraph, fmtTimeSec, summarize } from "@/lib/model";
 import { errText, isTauri, pult, type NodeState, type NodeView } from "@/lib/pult";
 import { useUpdater } from "@/lib/updater";
@@ -34,6 +37,10 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [reveal, setReveal] = useState(0);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [view, setView] = useState<"map" | "fleet">("map");
+  // Рой слушаем и с карты: число проблем на ярлыке вкладки видно, не переключаясь.
+  const fleet = useFleet();
+  const fleetProblems = fleet.view?.problems ?? 0;
   const returnFocus = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
@@ -136,10 +143,21 @@ export default function App() {
 
   const warnings = inv?.warnings.length ?? 0;
   return (
-    <div className="flex h-screen flex-col">
+    <Tabs value={view} onValueChange={(v) => setView(v as "map" | "fleet")} className="h-screen gap-0">
       <header className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2">
         <h1 className="text-base font-semibold">Пульт</h1>
         <span className="text-xs text-muted-foreground">{version}</span>
+        <TabsList variant="line" className="h-7">
+          <TabsTrigger value="map">Карта</TabsTrigger>
+          <TabsTrigger value="fleet">
+            Рой
+            {fleetProblems > 0 && (
+              <span className="rounded-full bg-root px-1.5 text-[10px] leading-4 font-semibold text-white" aria-label={`проблем: ${fleetProblems}`}>
+                {fleetProblems}
+              </span>
+            )}
+          </TabsTrigger>
+        </TabsList>
         {!isTauri && (
           <span className="rounded-full border border-warn/50 bg-warn-bg px-2 text-[11px] leading-5 text-warn-fg" title="Пульт открыт в браузере без ядра: все данные выдуманные">
             демо-данные
@@ -147,17 +165,17 @@ export default function App() {
         )}
         <span className="flex-1" />
         {actionError && <span className="max-w-72 truncate text-xs text-root-fg" title={actionError}>{actionError}</span>}
-        {snapshot && nodes.length > 0 && (
+        {view === "map" && snapshot && nodes.length > 0 && (
           <span className={silent ? "text-xs font-medium text-warn-fg" : "text-xs text-muted-foreground"} aria-live="off">
             {silent ? `Новых проверок нет с ${fmtTimeSec(new Date(cycleAt!).toISOString())}` : `Проверка № ${snapshot.cycle} · ${fmtTimeSec(new Date(cycleAt ?? Date.now()).toISOString())}`}
           </span>
         )}
-        {warnings > 0 && (
+        {view === "map" && warnings > 0 && (
           <Button size="xs" variant="outline" onClick={() => setSettingsOpen(true)} className="border-warn/50 bg-warn-bg text-warn-fg">
             <TriangleAlert /> Предупреждений: {warnings}
           </Button>
         )}
-        {snapshot && nodes.length > 0 && (
+        {view === "map" && snapshot && nodes.length > 0 && (
           <Button size="sm" variant="outline" onClick={recheckAll}>
             <RefreshCw /> Проверить всё
           </Button>
@@ -168,15 +186,20 @@ export default function App() {
       </header>
 
       <UpdateBanner updater={updater} />
-      {snapshot && error && (
-        <p role="alert" className="border-b bg-warn-bg px-4 py-1.5 text-xs text-warn-fg">
-          Карта может не обновляться: {error}
-        </p>
-      )}
-
-      {body}
+      {/* Карта остаётся смонтированной на вкладке роя: иначе при возврате теряется вид и раскладка. */}
+      <TabsContent value="map" forceMount className="flex min-h-0 flex-col text-base data-[state=inactive]:hidden">
+        {snapshot && error && (
+          <p role="alert" className="border-b bg-warn-bg px-4 py-1.5 text-xs text-warn-fg">
+            Карта может не обновляться: {error}
+          </p>
+        )}
+        {body}
+      </TabsContent>
+      <TabsContent value="fleet" className="flex min-h-0 flex-col text-base">
+        <FleetScreen view={fleet.view} error={fleet.error} now={now} />
+      </TabsContent>
 
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} inventory={inv} updater={updater} version={version} />
-    </div>
+    </Tabs>
   );
 }

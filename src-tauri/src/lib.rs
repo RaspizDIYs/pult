@@ -55,6 +55,7 @@ pub fn run() {
             commands::open_logs,
             commands::close_logs,
             commands::open_url,
+            sources::fleet::get_fleet,
         ])
         .on_window_event(|window, event| {
             // Закрытие окна только прячет его: проверки и трей работают дальше, выход — из меню трея.
@@ -73,6 +74,7 @@ pub fn run() {
                 tray::create(app.handle())?;
                 let data_dir = app.path().app_data_dir()?;
                 app.manage(monitor::Monitor::start(app.handle().clone(), data_dir));
+                app.manage(sources::fleet::Fleet::start(app.handle().clone()));
                 // Окно создаём сами (в конфиге create: false), чтобы в режиме флагов его не было вовсе.
                 WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
                     .visible(!hidden)
