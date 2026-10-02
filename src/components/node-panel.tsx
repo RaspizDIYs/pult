@@ -77,6 +77,7 @@ export function NodePanel({ node, state, nodes, states, graph, now, onSelect, on
           </h2>
           <p className="truncate text-xs text-muted-foreground">
             {kindLabel}
+            {node.project ? ` · проект «${node.project}»` : ""}
             {node.group ? ` · группа «${node.group}»` : ""}
             {node.undeclared ? " · не описан в инвентаре" : ""}
           </p>

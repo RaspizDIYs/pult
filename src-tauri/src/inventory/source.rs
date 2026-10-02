@@ -215,6 +215,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
     }
 
+    /// Свой каталог — тем же кодом, что у приложения:
+    /// `PULT_INVENTORY=путь/к/каталогу cargo test own_inventory_is_valid -- --ignored --nocapture`
+    #[test]
+    #[ignore = "нужен каталог в PULT_INVENTORY"]
+    fn own_inventory_is_valid() {
+        let dir = PathBuf::from(std::env::var("PULT_INVENTORY").expect("задай PULT_INVENTORY"));
+        let data = temp_dir("own");
+        let state = InventoryState::startup(&data, Some(&dir));
+        assert_eq!(state.error, None);
+        let inv = state.inventory();
+        let hidden: Vec<&str> = inv.nodes.iter().filter(|n| n.hidden).map(|n| n.id.as_str()).collect();
+        println!("узлов: {}, скрыто: {hidden:?}, предупреждений: {:?}", inv.nodes.len(), state.warnings());
+        let _ = std::fs::remove_dir_all(data);
+    }
+
     /// Находка ревью 6: нечитаемый личный файл считался отсутствующим — его узлы молча пропадали.
     #[test]
     fn unreadable_personal_file_is_an_error_not_absence() {

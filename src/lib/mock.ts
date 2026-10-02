@@ -8,6 +8,10 @@
 // Параметр адреса ?mock= фиксирует сценарий, чтобы его можно было рассматривать и снимать:
 //   ok | containers | host | tunnel | mixed   — шаг сценария (по умолчанию шаги сменяются сами);
 //   no-inventory | empty | inventory-error | loading — экраны без карты и с ошибкой инвентаря.
+//
+// На карте три площадки (два хоста и гипервизор с ВМ) и «Сеть и внешнее», сервисы разложены
+// по проектам; заглушка на хосте А скрыта (`скрыть: true`) — её проверяют, но не показывают;
+// в шаге containers корень отказа лежит глубоко: гипервизор → хост Б → «Задачи» → панель.
 import type {
   Backend,
   CheckResult,
@@ -50,6 +54,8 @@ interface Def {
   title: string;
   kind: string;
   group?: string;
+  project?: string;
+  hidden?: boolean; // скрыть: true — ядро проверяет, но в снимок не кладёт
   on?: string;
   dependsOn?: string[];
   probes?: Probe[];
@@ -78,16 +84,17 @@ const DEFS: Def[] = [
     access: { how: "ssh host-c", secret: "хранилище → ключ ssh хоста В", who: ["alice"] },
   },
   { id: "прокси", title: "Обратный прокси", kind: "контейнер", group: "прод", on: "хост-а", container: "edge-proxy", probes: [http("https://example.com/ping", 35)] },
-  { id: "база", title: "База данных", kind: "контейнер", group: "прод", on: "хост-а", container: "pg-main", access: { how: "docker exec -it pg-main psql", secret: "хранилище → пароль БД", who: ["alice"] } },
-  { id: "кэш", title: "Кэш", kind: "контейнер", group: "прод", on: "хост-а", container: "redis-cache" },
-  { id: "очередь", title: "Очередь задач", kind: "контейнер", group: "прод", on: "хост-а", container: "queue" },
+  { id: "база", title: "База данных", kind: "контейнер", group: "прод", project: "Магазин", on: "хост-а", container: "pg-main", access: { how: "docker exec -it pg-main psql", secret: "хранилище → пароль БД", who: ["alice"] } },
+  { id: "кэш", title: "Кэш", kind: "контейнер", group: "прод", project: "Магазин", on: "хост-а", container: "redis-cache" },
+  { id: "очередь", title: "Очередь задач", kind: "контейнер", group: "прод", project: "Магазин", on: "хост-а", container: "queue" },
+  { id: "заглушка", title: "Заглушка «сайт обновляется»", kind: "контейнер", group: "прод", on: "хост-а", container: "maintenance", hidden: true },
   { id: "хост-а/grafana-old", title: "grafana-old", kind: "контейнер", group: "прод", on: "хост-а", container: "grafana-old", undeclared: true },
-  { id: "почта", title: "Почтовый шлюз", kind: "контейнер", group: "прод", on: "хост-в", container: "mail-gw", probes: [tcp("mail.example.com", 25, 55)] },
-  { id: "вики", title: "Вики", kind: "контейнер", group: "прод", on: "хост-в", container: "wiki", probes: [http("https://wiki.example.com/", 80)], links: [{ title: "Открыть вики", url: "https://wiki.example.com" }] },
-  { id: "копии", title: "Резервные копии", kind: "сервис", group: "прод", dependsOn: ["хост-в"] },
-  { id: "сайт", title: "Сайт", kind: "контейнер", group: "прод", on: "хост-а", dependsOn: ["прокси"], container: "web", probes: [http("https://www.example.com/", 90)], links: [{ title: "Открыть сайт", url: "https://www.example.com" }] },
-  { id: "api", title: "API", kind: "контейнер", group: "прод", on: "хост-а", dependsOn: ["прокси", "база"], container: "api", probes: [http("https://api.example.com/health", 48)], links: [{ title: "Метрики", url: "https://metrics.example.com/d/api" }] },
-  { id: "воркер", title: "Воркер", kind: "контейнер", group: "прод", on: "хост-а", dependsOn: ["очередь", "база"], container: "worker" },
+  { id: "почта", title: "Почтовый шлюз", kind: "контейнер", group: "прод", project: "Почта", on: "хост-в", container: "mail-gw", probes: [tcp("mail.example.com", 25, 55)] },
+  { id: "вики", title: "Вики", kind: "контейнер", group: "прод", project: "Вики", on: "хост-в", container: "wiki", probes: [http("https://wiki.example.com/", 80)], links: [{ title: "Открыть вики", url: "https://wiki.example.com" }] },
+  { id: "копии", title: "Резервные копии", kind: "сервис", group: "прод", on: "хост-в" },
+  { id: "сайт", title: "Сайт", kind: "контейнер", group: "прод", project: "Магазин", on: "хост-а", dependsOn: ["прокси"], container: "web", probes: [http("https://www.example.com/", 90)], links: [{ title: "Открыть сайт", url: "https://www.example.com" }] },
+  { id: "api", title: "API", kind: "контейнер", group: "прод", project: "Магазин", on: "хост-а", dependsOn: ["прокси", "база"], container: "api", probes: [http("https://api.example.com/health", 48)], links: [{ title: "Метрики", url: "https://metrics.example.com/d/api" }] },
+  { id: "воркер", title: "Воркер", kind: "контейнер", group: "прод", project: "Магазин", on: "хост-а", dependsOn: ["очередь", "база"], container: "worker" },
   {
     id: "туннель-дом", title: "WireGuard до дома", kind: "туннель", group: "дом", dependsOn: ["хост-а"],
     probes: [tcp("10.0.0.2", 22, 38, "хост-а")],
@@ -101,18 +108,18 @@ const DEFS: Def[] = [
   },
   { id: "хост-г", title: "Хост Г (медиа)", kind: "вм", group: "дом", on: "гипервизор", dependsOn: ["туннель-дом"], collect: "docker", via: "хост-а" },
   {
-    id: "панель", title: "Панель задач", kind: "контейнер", group: "дом", on: "хост-б", container: "tasks-panel",
+    id: "панель", title: "Панель задач", kind: "контейнер", group: "дом", project: "Задачи", on: "хост-б", container: "tasks-panel",
     probes: [http("https://tasks.example.com/health", 52)],
     access: { how: "https://tasks.example.com", secret: "хранилище → токен панели", who: ["alice", "bob"] },
     links: [{ title: "Открыть панель", url: "https://tasks.example.com" }, { title: "Логи", url: "https://logs.example.com/tasks-panel" }],
   },
-  { id: "мигратор", title: "Мигратор БД", kind: "контейнер", group: "дом", on: "хост-б", container: "db-migrator", expected: "остановлен" },
-  { id: "мониторинг", title: "Мониторинг", kind: "контейнер", group: "дом", on: "хост-б", container: "prom", probes: [http("http://10.0.0.2:9090/-/healthy", 20, "хост-а")] },
-  { id: "бот", title: "Бот уведомлений", kind: "контейнер", group: "дом", on: "хост-б", dependsOn: ["панель"], container: "notify-bot", probes: [http("https://bot.example.com/health", 70)] },
-  { id: "статистика", title: "Статистика", kind: "сервис", group: "дом", dependsOn: ["панель", "хост-б"], probes: [tcp("10.0.0.2", 9100, 15, "хост-а")] },
-  { id: "медиа", title: "Медиасервер", kind: "контейнер", group: "дом", on: "хост-г", container: "media" },
-  { id: "загрузчик", title: "Загрузчик", kind: "контейнер", group: "дом", on: "хост-г", container: "fetcher" },
-  { id: "ollama", title: "Локальная модель", kind: "сервис", group: "дом", on: "хост-г", probes: [http("http://10.0.0.4:11434/api/tags", 120, "хост-а")] },
+  { id: "мигратор", title: "Мигратор БД", kind: "контейнер", group: "дом", project: "Задачи", on: "хост-б", container: "db-migrator", expected: "остановлен" },
+  { id: "мониторинг", title: "Мониторинг", kind: "контейнер", group: "дом", project: "Мониторинг", on: "хост-б", container: "prom", probes: [http("http://10.0.0.2:9090/-/healthy", 20, "хост-а")] },
+  { id: "бот", title: "Бот уведомлений", kind: "контейнер", group: "дом", project: "Задачи", on: "хост-б", dependsOn: ["панель"], container: "notify-bot", probes: [http("https://bot.example.com/health", 70)] },
+  { id: "статистика", title: "Статистика", kind: "сервис", group: "дом", project: "Мониторинг", on: "хост-б", dependsOn: ["панель"], probes: [tcp("10.0.0.2", 9100, 15, "хост-а")] },
+  { id: "медиа", title: "Медиасервер", kind: "контейнер", group: "дом", project: "Медиа", on: "хост-г", container: "media" },
+  { id: "загрузчик", title: "Загрузчик", kind: "контейнер", group: "дом", project: "Медиа", on: "хост-г", container: "fetcher" },
+  { id: "ollama", title: "Локальная модель", kind: "сервис", group: "дом", project: "ИИ", on: "хост-г", probes: [http("http://10.0.0.4:11434/api/tags", 120, "хост-а")] },
 ];
 
 const byId = new Map(DEFS.map((d) => [d.id, d]));
@@ -348,8 +355,12 @@ const emit = (event: string, payload: unknown) => listeners.get(event)?.forEach(
 const stepIndex = (c: number) => frozen ?? Math.floor((c - 1) / 2) % STEPS.length;
 const record = (s: NodeState) => (history[s.id] ??= []).push({ at: s.since ?? new Date().toISOString(), own: s.own, fact: s.fact });
 
-const views: NodeView[] = DEFS.map((d) => ({
-  id: d.id, title: d.title, kind: d.kind, group: d.group ?? null, on: d.on ?? null,
+// Скрытые узлы макет оценивает, как ядро, но в снимок и события не отдаёт (контракт, раздел 3).
+const hiddenIds = new Set(DEFS.filter((d) => d.hidden).map((d) => d.id));
+const shown = (all: Record<string, NodeState>) => Object.fromEntries(Object.entries(all).filter(([id]) => !hiddenIds.has(id)));
+
+const views: NodeView[] = DEFS.filter((d) => !d.hidden).map((d) => ({
+  id: d.id, title: d.title, kind: d.kind, group: d.group ?? null, project: d.project ?? null, on: d.on ?? null,
   dependsOn: d.dependsOn ?? [], access: d.access ?? null, links: d.links ?? [],
   undeclared: !!d.undeclared, hasLogs: !!d.container,
 }));
@@ -404,7 +415,7 @@ function tick() {
       changed.push(states[id]);
     }
   }
-  if (mode === "run" || mode === "inventory-error") emit("pult://states", { cycle, states: changed });
+  if (mode === "run" || mode === "inventory-error") emit("pult://states", { cycle, states: changed.filter((s) => !hiddenIds.has(s.id)) });
 }
 
 function snapshot(): Snapshot {
@@ -423,7 +434,7 @@ function snapshot(): Snapshot {
       warnings: visible ? ["узел «кэш»: незнакомое поле «приоритет», оно проигнорировано"] : [],
     },
     nodes: visible ? views : [],
-    states: visible ? states : {},
+    states: visible ? shown(states) : {},
   };
 }
 
@@ -468,7 +479,7 @@ const timers = new Map<string, ReturnType<typeof setInterval>>();
 function recheck(id?: string) {
   setTimeout(() => {
     const at = new Date().toISOString();
-    const ids = id ? [id] : Object.keys(states);
+    const ids = id ? [id] : Object.keys(shown(states));
     const upd = ids.filter((i) => states[i]).map((i) => {
       const cur = states[i];
       return (states[i] = {

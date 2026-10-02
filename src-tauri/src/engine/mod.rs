@@ -66,7 +66,9 @@ pub fn evaluate(
     let mut states: Vec<NodeState> = inv.nodes.iter().map(|n| own_state(n, facts, now)).collect();
 
     let index: HashMap<&str, usize> = inv.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
-    let failed: Vec<bool> = states.iter().map(|s| s.own == OwnStatus::Fail).collect();
+    // Скрытый узел корнем не бывает и чужой причиной не числится: на карте его нет, а «причина
+    // выше: <невидимое>» не объясняла бы ничего. Отказ его видимого ребёнка тогда сам станет корнем.
+    let failed: Vec<bool> = states.iter().zip(&inv.nodes).map(|(s, n)| s.own == OwnStatus::Fail && !n.hidden).collect();
     // ponytail: предки обходом для каждого узла, O(n²); хватит на сотни узлов
     let ancestors: Vec<Vec<usize>> = inv.nodes.iter().map(|n| ancestors(n, inv, &index)).collect();
     let is_root: Vec<bool> = (0..states.len())

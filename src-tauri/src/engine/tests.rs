@@ -315,3 +315,16 @@ fn reevaluating_old_collection_does_not_confirm() {
     let third = evaluate(&inv, &f, &again, 3, NOW + Duration::from_secs(60));
     assert!(third.iter().find(|s| s.id == "база").unwrap().confirmed, "новый сбор с тем же итогом — подтверждение");
 }
+
+#[test]
+fn hidden_node_is_never_a_root_or_a_cause() {
+    let inv = inv(r#"
+  - {id: хост-а, название: А, вид: хост, скрыть: true, проверки: [{вид: tcp, адрес: "a.example.com:22"}]}
+  - {id: сайт, название: Сайт, вид: сервис, зависит_от: [хост-а], проверки: [{вид: tcp, адрес: "site.example.com:443"}]}
+"#);
+    let s = eval(&inv, &facts(&[("хост-а", Some(false), "порт 22: таймаут 3 с"), ("сайт", Some(false), "порт 443: таймаут 3 с")]));
+    assert_eq!(s["хост-а"].own, OwnStatus::Fail, "скрытый проверяется как обычно");
+    assert!(!s["хост-а"].is_root);
+    assert!(s["сайт"].is_root, "видимый отказ под скрытым — сам корень");
+    assert!(s["сайт"].blocked_by.is_empty());
+}

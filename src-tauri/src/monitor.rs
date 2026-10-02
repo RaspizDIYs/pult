@@ -327,6 +327,9 @@ impl Monitor {
             s.node_ids = ids;
             self.emit(EVENT_SNAPSHOT, s.snapshot());
         }
+        // Скрытые узлы проверяются, но интерфейсу о них не говорим — как и в снимке.
+        let hidden: HashSet<&str> = inv.nodes.iter().filter(|n| n.hidden).map(|n| n.id.as_str()).collect();
+        let states = states.into_iter().filter(|st| !hidden.contains(st.id.as_str())).collect();
         self.emit(EVENT_STATES, StatesEvent { cycle, states });
     }
 
@@ -468,6 +471,9 @@ impl State {
         let inv = self.effective_inventory();
         let accepted = self.inventory.accepted.as_ref();
         let declared: HashSet<&str> = accepted.iter().flat_map(|a| a.inventory.nodes.iter().map(|n| n.id.as_str())).collect();
+        // Скрытые узлы остаются в движке (их контейнер не превращается в «не описан»), но ни на
+        // карту, ни в счётчики интерфейса не попадают.
+        let hidden: HashSet<&str> = inv.nodes.iter().filter(|n| n.hidden).map(|n| n.id.as_str()).collect();
         Snapshot {
             cycle: self.cycle,
             taken_at: self.taken_at,
@@ -481,9 +487,10 @@ impl State {
             nodes: inv
                 .nodes
                 .iter()
+                .filter(|n| !n.hidden)
                 .map(|n| NodeView { undeclared: !declared.contains(n.id.as_str()), ..NodeView::new(n, &inv) })
                 .collect(),
-            states: self.states.clone(),
+            states: self.states.iter().filter(|(id, _)| !hidden.contains(id.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
 }
@@ -512,7 +519,7 @@ mod tests {
             assert!(json["inventory"].get(key).is_some(), "inventory.{key}");
         }
         let node = &json["nodes"][0];
-        for key in ["id", "title", "kind", "group", "on", "dependsOn", "access", "links", "undeclared", "hasLogs"] {
+        for key in ["id", "title", "kind", "group", "project", "on", "dependsOn", "access", "links", "undeclared", "hasLogs"] {
             assert!(node.get(key).is_some(), "node.{key}");
         }
         assert_eq!(node["kind"], "внешнее");
@@ -556,6 +563,22 @@ mod tests {
         std::fs::write(catalog.join(inventory::FILE_NAME), "битый: [").unwrap();
         assert_eq!(state.reload(&data), Some(false), "ошибка видна, карта прежняя");
         assert!(state.inventory.error.is_some());
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(catalog);
+    }
+
+    #[test]
+    fn hidden_node_is_checked_but_not_shown() {
+        let data = temp_data("hidden");
+        let catalog = temp_data("hidden-catalog");
+        let yaml = "версия_схемы: 1\nузлы:\n  - {id: а, название: А, вид: хост, проверки: [{вид: tcp, адрес: \"a:1\"}]}\n  - {id: заглушка, название: Заглушка, вид: сервис, проект: Сайт, скрыть: true, проверки: [{вид: tcp, адрес: \"b:1\"}]}\n";
+        std::fs::write(catalog.join(inventory::FILE_NAME), yaml).unwrap();
+        let settings = Settings { inventory_path: Some(catalog.display().to_string()), ..Settings::default() };
+        let state = State::new(&data, settings);
+        assert!(state.states.contains_key("заглушка"), "движок его оценивает");
+        let snap = state.snapshot();
+        assert_eq!(snap.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["а"]);
+        assert!(!snap.states.contains_key("заглушка"));
         let _ = std::fs::remove_dir_all(data);
         let _ = std::fs::remove_dir_all(catalog);
     }

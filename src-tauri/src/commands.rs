@@ -23,6 +23,7 @@ pub struct NodeView {
     /// Значение `вид` из инвентаря как есть: «хост», «контейнер»…
     pub kind: NodeKind,
     pub group: Option<String>,
+    pub project: Option<String>,
     pub on: Option<String>,
     pub depends_on: Vec<String>,
     pub access: Option<AccessView>,
@@ -55,6 +56,7 @@ impl NodeView {
             title: n.title.clone(),
             kind: n.kind,
             group: n.group.clone(),
+            project: n.project.clone(),
             on: n.on.clone(),
             depends_on: n.depends_on.clone(),
             access: n.access.as_ref().map(|a| AccessView { how: a.how.clone(), secret: a.secret.clone(), who: a.who.clone() }),

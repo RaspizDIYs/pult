@@ -2,7 +2,6 @@ import { getVersion } from "@tauri-apps/api/app";
 import { RefreshCw, Settings as SettingsIcon, TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FleetScreen } from "@/components/fleet-screen";
-import { GraphMap } from "@/components/graph-map";
 import { NodePanel } from "@/components/node-panel";
 import {
   EmptyInventoryScreen,
@@ -14,6 +13,7 @@ import {
 } from "@/components/screens";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { Summary } from "@/components/summary";
+import { TreeMap } from "@/components/tree-map";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { UpdateBanner } from "@/components/update-banner";
@@ -134,7 +134,7 @@ export default function App() {
           )}
           <main className="relative order-1 min-h-0 min-w-0 flex-1">
             <div className="absolute inset-0">
-              <GraphMap nodes={nodes} states={states} selectedId={selected?.id ?? null} revealToken={reveal} onSelect={onMapSelect} />
+              <TreeMap nodes={nodes} states={states} graph={graph} selectedId={selected?.id ?? null} revealToken={reveal} onSelect={onMapSelect} />
             </div>
           </main>
         </div>
