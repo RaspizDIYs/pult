@@ -206,12 +206,53 @@ pub fn parse(text: &str) -> Result<(Inventory, Vec<String>), String> {
         }
         Some(_) => {}
     }
-    let mut warnings = Vec::new();
+    let mut unknown = Vec::new();
     let inv: Inventory = serde_ignored::deserialize(serde_yaml::Deserializer::from_str(text), |path| {
-        warnings.push(format!("незнакомое поле {path} пропущено"))
+        unknown.push(path.to_string())
     })
     .map_err(|e| e.to_string())?;
+    let warnings = unknown_fields(&unknown, &inv);
     Ok((inv, warnings))
+}
+
+/// Одна строка на незнакомое поле, а не на каждое его вхождение: новое поле схемы у
+/// не обновившихся выглядело бы стеной одинаковых предупреждений, похожей на аварию.
+fn unknown_fields(paths: &[String], inv: &Inventory) -> Vec<String> {
+    // Поле без номеров («проверки.порт») и номера узлов, где оно встретилось, в порядке файла.
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for path in paths {
+        let parts: Vec<&str> = path.split('.').collect();
+        let node = match parts.as_slice() {
+            ["узлы", i, ..] => i.parse::<usize>().ok(),
+            _ => None,
+        };
+        let skip = usize::from(node.is_some()); // «узлы» в начале пути ничего не добавляет
+        let field = parts.iter().filter(|p| p.parse::<usize>().is_err()).skip(skip).copied().collect::<Vec<_>>().join(".");
+        let at = match groups.iter_mut().position(|(f, _)| *f == field) {
+            Some(at) => at,
+            None => {
+                groups.push((field, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        if let Some(i) = node.filter(|i| !groups[at].1.contains(i)) {
+            groups[at].1.push(i);
+        }
+    }
+    let id = |i: usize| format!("«{}»", inv.nodes.get(i).map_or("?", |n| n.id.as_str()));
+    groups
+        .into_iter()
+        .map(|(field, nodes)| {
+            let whose = match nodes.len() {
+                0 => String::new(),
+                1 => format!(" у узла {}", id(nodes[0])),
+                2 | 3 => format!(" у узлов {}", nodes.iter().map(|&i| id(i)).collect::<Vec<_>>().join(", ")),
+                n if n % 10 == 1 && n % 100 != 11 => format!(" у {n} узла"),
+                n => format!(" у {n} узлов"),
+            };
+            format!("незнакомое поле «{field}»{whose} пропущено: эта версия Пульта его не знает — обнови приложение, если это не опечатка")
+        })
+        .collect()
 }
 
 /// Личные узлы поверх каталога: узел с тем же id заменяет узел каталога.
@@ -494,6 +535,21 @@ mod tests {
         .unwrap();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("цвет"), "{warnings:?}");
+    }
+
+    #[test]
+    fn unknown_field_is_one_warning_however_many_nodes_have_it() {
+        let nodes: String = (0..21).map(|i| format!("  - {{id: у{i}, название: У, вид: хост, приоритет: {i}}}\n")).collect();
+        let yaml = format!(
+            "версия_схемы: 1\nузлы:\n{nodes}  - {{id: а, название: А, вид: хост, цвет: синий, проверки: [{{вид: tcp, адрес: \"a:1\", порт: 2}}, {{вид: tcp, адрес: \"a:2\", порт: 3}}]}}\nавтор: я\n"
+        );
+        let (_, warnings) = parse(&yaml).unwrap();
+        assert_eq!(warnings.len(), 4, "{warnings:#?}");
+        assert!(warnings[0].starts_with("незнакомое поле «приоритет» у 21 узла пропущено"), "{warnings:#?}");
+        assert!(warnings[0].contains("обнови приложение"), "{warnings:#?}");
+        assert!(warnings[1].starts_with("незнакомое поле «цвет» у узла «а»"), "{warnings:#?}");
+        assert!(warnings[2].starts_with("незнакомое поле «проверки.порт» у узла «а»"), "{warnings:#?}");
+        assert!(warnings[3].starts_with("незнакомое поле «автор» пропущено"), "{warnings:#?}");
     }
 
     #[test]
