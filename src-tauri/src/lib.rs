@@ -46,6 +46,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            sources::panel::panel_config,
+            sources::panel::panel_set_url,
+            sources::panel::panel_set_token,
+            sources::panel::panel_tasks,
+            sources::panel::panel_task,
+            sources::panel::panel_projects,
+            sources::panel::panel_epics,
+            sources::panel::panel_overview,
             commands::get_snapshot,
             commands::recheck,
             commands::get_history,
@@ -73,6 +81,7 @@ pub fn run() {
                 // Ядро и трей — только в обычном режиме: флагам обновления они не нужны.
                 tray::create(app.handle())?;
                 let data_dir = app.path().app_data_dir()?;
+                app.manage(sources::panel::Panel::new(data_dir.clone()));
                 app.manage(monitor::Monitor::start(app.handle().clone(), data_dir));
                 app.manage(sources::fleet::Fleet::start(app.handle().clone()));
                 // Окно создаём сами (в конфиге create: false), чтобы в режиме флагов его не было вовсе.

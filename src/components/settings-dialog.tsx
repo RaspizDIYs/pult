@@ -9,6 +9,7 @@ import { Switch } from "@/components/ui/switch";
 import { fmtDayTime, fmtTime } from "@/lib/model";
 import { errText, isTauri, pult, type EnvCheck, type InventoryInfo, type Settings } from "@/lib/pult";
 import type { useUpdater } from "@/lib/updater";
+import { PanelSettings } from "@/tasks/panel-settings";
 
 export function useSettings(active = true) {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -258,6 +259,7 @@ export function SettingsDialog({
           </div>
         </section>
 
+        <PanelSettings />
         <Environment />
         <UpdatesBlock updater={updater} version={version} />
       </DialogContent>
