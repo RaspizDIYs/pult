@@ -86,6 +86,8 @@ fn report(plan: &HostPlan, all: &[Section], out: &mut Vec<HostReport>) {
             match check {
                 RemoteCheck::Tcp { .. } => outcome(section, parse_tcp),
                 RemoteCheck::Http { .. } => outcome(section, parse_http),
+                RemoteCheck::Ollama { .. } => outcome(section, parse_ollama),
+                RemoteCheck::OllamaAsk { .. } => outcome(section, parse_ask),
             }
         })
         .collect();
@@ -265,7 +267,7 @@ fn parse_tcp(lines: &[&str]) -> Result<ProbeResult, String> {
         _ if !detail.is_empty() => detail.join("; "),
         _ => format!("нет соединения (код {rc})"),
     };
-    Ok(ProbeResult { connected: rc == 0, http_code: None, latency_ms: None, fact })
+    Ok(ProbeResult { connected: rc == 0, fact, ..ProbeResult::default() })
 }
 
 /// Строка `@http <код> <секунды> <код curl>`.
@@ -281,6 +283,11 @@ fn parse_http(lines: &[&str]) -> Result<ProbeResult, String> {
     };
     let code: u16 = code.parse().unwrap_or(0);
     let rc: i32 = rc.parse().map_err(|_| format!("http: непонятный ответ {line:?}"))?;
+    Ok(curl_result(code, time, rc))
+}
+
+/// Итог одного запроса curl; тела ответа здесь нет.
+fn curl_result(code: u16, time: &str, rc: i32) -> ProbeResult {
     if rc != 0 || code == 0 {
         let fact = match rc {
             6 => "имя не разрешилось".to_owned(),
@@ -292,16 +299,51 @@ fn parse_http(lines: &[&str]) -> Result<ProbeResult, String> {
             56 => "соединение оборвалось".to_owned(),
             _ => format!("ошибка curl {rc}"),
         };
-        return Ok(ProbeResult { connected: false, http_code: None, latency_ms: None, fact });
+        return ProbeResult { fact, ..ProbeResult::default() };
     }
     // Десятичный разделитель у curl может зависеть от локали.
     let secs: f64 = time.replace(',', ".").parse().unwrap_or(0.0);
-    Ok(ProbeResult {
+    ProbeResult {
         connected: true,
         http_code: Some(code),
         latency_ms: Some((secs * 1000.0).round() as u64),
         fact: format!("HTTP {code}"),
-    })
+        bodies: Vec::new(),
+    }
+}
+
+/// Ответ одного запроса `pult_body`: строки помечены `<имя>|`, последняя из них —
+/// `@<код http> <секунды> <код curl>`, остальные — тело. Нет итоговой строки — тело обрезано
+/// пределом размера: такой ответ не принимаем, а не разбираем половину JSON.
+fn body(lines: &[&str], name: &str) -> Result<ProbeResult, String> {
+    let prefix = format!("{name}|");
+    let own: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix(prefix.as_str())).collect();
+    let (last, text) = own.split_last().ok_or_else(|| format!("{name}: ответа нет"))?;
+    let f: Vec<&str> = last.strip_prefix('@').map(|v| v.split_whitespace().collect()).unwrap_or_default();
+    let [code, time, rc] = f[..] else {
+        return Err(format!("{name}: ответ длиннее {} КБ, обрезан", crate::probes::ollama::MAX_BODY >> 10));
+    };
+    let rc: i32 = rc.parse().map_err(|_| format!("{name}: непонятный ответ {last:?}"))?;
+    let mut result = curl_result(code.parse().unwrap_or(0), time, rc);
+    if result.connected {
+        result.bodies = vec![text.join("\n")];
+    }
+    Ok(result)
+}
+
+/// Проверка ollama: решает `/api/tags`; `/api/ps` — дополнение, его отсутствие не ошибка.
+fn parse_ollama(lines: &[&str]) -> Result<ProbeResult, String> {
+    let mut tags = body(lines, "tags")?;
+    if let Ok(ps) = body(lines, "ps") {
+        if tags.connected && ps.http_code == Some(200) {
+            tags.bodies.extend(ps.bodies);
+        }
+    }
+    Ok(tags)
+}
+
+fn parse_ask(lines: &[&str]) -> Result<ProbeResult, String> {
+    body(lines, "ask")
 }
 
 #[cfg(test)]

@@ -5,6 +5,8 @@ use super::{Collector, Hop, HostPlan, PlanError, RemoteCheck};
 
 /// Предел одного вложенного перехода: зависший дом не должен съесть общие 45 секунд.
 const NESTED_LIMIT_SECS: u32 = 15;
+/// Предел тела ответа Ollama, байт: тот же, что у проверки с этой машины.
+const BODY_LIMIT: usize = crate::probes::ollama::MAX_BODY;
 
 /// Общие функции, повторяются на каждом уровне цепочки (вложенный хост получает свой полный скрипт).
 /// - `pult_t` — предел времени: `timeout`, если на хосте есть совместимый (проверяем запуском, а не
@@ -23,6 +25,10 @@ const NESTED_LIMIT_SECS: u32 = 15;
 /// - `wg show all dump` и `showconf` печатают приватный ключ, поэтому только два безопасных вывода.
 /// - Проверки отвечают кодом 0, если проба состоялась (итог — в строке `@tcp`/`@http`), и не нулём,
 ///   только если её нечем выполнить: «узнать не удалось» и «порт закрыт» — разные факты.
+/// - `pult_body` возвращает тело ответа: его разбирает Пульт, а не sh. Тело ограничено `head -c`
+///   (место подстановки `@LIMIT@`), а каждая его строка помечена именем запроса: чужой сервер не
+///   должен суметь напечатать строку `@@pult …` и подделать секцию соседней проверки. Последняя
+///   строка — `@<код http> <секунды> <код curl>`; нет её — тело обрезано пределом.
 /// - Вложенный ssh с `UpdateHostKeys=no`: иначе клиент на промежуточном хосте мог бы дописать его
 ///   `known_hosts`, а сбор на серверах ничего не пишет. Keepalive — как у внешнего: оборванный
 ///   канал замечается за 10 секунд, а не по пределу.
@@ -76,6 +82,20 @@ pult_http() {
   _c=$(curl -s -g -o /dev/null -w '%{http_code} %{time_total}' --max-time "$2" "$1")
   echo "@http $_c $?"
 }
+pult_body() {
+  _n=$1; shift
+  { curl -s -g -w '\n@%{http_code} %{time_total}' "$@"; echo " $?"; } | head -c @LIMIT@ | sed "s/^/$_n|/"
+  echo
+}
+pult_ollama() {
+  command -v curl >/dev/null 2>&1 || { echo 'нет curl'; return 127; }
+  pult_body tags --max-time "$2" "$1/api/tags"
+  pult_body ps --max-time "$2" "$1/api/ps"
+}
+pult_ask() {
+  command -v curl >/dev/null 2>&1 || { echo 'нет curl'; return 127; }
+  pult_body ask --max-time "$2" -H 'Content-Type: application/json' -d "$3" "$1/api/generate"
+}
 pult_ssh() {
   _h=$1; _l=$2; _g=$3; shift 3
   { _e=$(pult_t "$_l" ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o UpdateHostKeys=no "$@" "$_g" sh -s 2>&1 1>&3 3>&-); _r=$?; } 3>&1
@@ -93,7 +113,7 @@ pub fn build_script(plan: &HostPlan) -> Result<String, PlanError> {
 
 fn host_script(plan: &HostPlan, depth: usize, out: &mut String) {
     let id = quote(&plan.id);
-    out.push_str(PRELUDE);
+    out.push_str(&PRELUDE.replace("@LIMIT@", &BODY_LIMIT.to_string()));
     // Всё тело одной составной командой: shell разбирает его целиком до запуска, и ни одна
     // команда не дочитает из stdin остаток скрипта.
     out.push_str("{\n");
@@ -114,6 +134,13 @@ fn host_script(plan: &HostPlan, depth: usize, out: &mut String) {
             RemoteCheck::Http { url, timeout_ms } => {
                 format!("pult_http {} {}", quote(url), secs(*timeout_ms))
             }
+            RemoteCheck::Ollama { url, timeout_ms } => {
+                format!("pult_ollama {} {}", quote(url), secs(*timeout_ms))
+            }
+            RemoteCheck::OllamaAsk { url, model, timeout_ms } => {
+                let body = crate::probes::ollama::ask_body(model);
+                format!("pult_ask {} {} {}", quote(url), secs(*timeout_ms), quote(&body))
+            }
         };
         out.push_str(&format!("pult_sec {id} check.{i} {call} &\n"));
     }
@@ -123,8 +150,9 @@ fn host_script(plan: &HostPlan, depth: usize, out: &mut String) {
         let eof = format!("PULT_EOF_{}", depth + 1);
         let key = nested.hop.key.as_deref().map(|k| format!(" -i {}", quote(k)));
         out.push_str(&format!(
-            "pult_ssh {} {NESTED_LIMIT_SECS} {}{} <<'{eof}'\n",
+            "pult_ssh {} {} {}{} <<'{eof}'\n",
             quote(&nested.id),
+            hop_limit(nested),
             quote(&nested.hop.target),
             key.unwrap_or_default()
         ));
@@ -134,6 +162,18 @@ fn host_script(plan: &HostPlan, depth: usize, out: &mut String) {
     // Метка конца: без неё последняя секция хоста могла оборваться на середине.
     out.push_str(&format!("printf '@@pult 1 host=%s section=end rc=0\\n' {id}\n"));
     out.push_str("} </dev/null\n");
+}
+
+/// Предел перехода к вложенному хосту. Обычный сбор — `NESTED_LIMIT_SECS`. Генерация по кнопке
+/// грузит модель в память и идёт дольше, поэтому путь к ней ждёт её предел с запасом на каждом
+/// уровне: иначе ответ обрывался бы на пятнадцатой секунде.
+fn hop_limit(plan: &HostPlan) -> u32 {
+    let ask = plan.checks.iter().filter_map(|c| match c {
+        RemoteCheck::OllamaAsk { timeout_ms, .. } => Some(secs(*timeout_ms) + 10),
+        _ => None,
+    });
+    let below = plan.nested.iter().map(hop_limit).filter(|l| *l > NESTED_LIMIT_SECS).map(|l| l + 5);
+    ask.chain(below).max().unwrap_or(NESTED_LIMIT_SECS)
 }
 
 /// Скрипт логов для `hops[0]`: на последнем хосте `docker logs -f`, на промежуточных — `exec ssh`.
@@ -176,6 +216,11 @@ fn validate(plan: &HostPlan) -> Result<(), PlanError> {
         match c {
             RemoteCheck::Tcp { host, .. } => check(id, "адрес tcp-проверки", host, is_plain)?,
             RemoteCheck::Http { url, .. } => check(id, "url http-проверки", url, is_url)?,
+            RemoteCheck::Ollama { url, .. } => check(id, "url проверки ollama", url, is_url)?,
+            RemoteCheck::OllamaAsk { url, model, .. } => {
+                check(id, "url сервера ollama", url, is_url)?;
+                check(id, "имя модели", model, is_plain)?;
+            }
         }
     }
     plan.nested.iter().try_for_each(validate)
@@ -251,6 +296,11 @@ mod tests {
             p.checks = vec![RemoteCheck::Http { url: format!("https://example.com/{v}"), timeout_ms: 3000 }];
             // В пути url пустота и ведущий дефис законны, остальное — нет.
             assert!(v.is_empty() || v.starts_with('-') || build_script(&p).is_err(), "url {v:?}");
+            p = host("хост-а", "user@10.0.0.2");
+            p.checks = vec![RemoteCheck::Ollama { url: format!("http://10.0.0.5:11434/{v}"), timeout_ms: 3000 }];
+            assert!(v.is_empty() || v.starts_with('-') || build_script(&p).is_err(), "ollama {v:?}");
+            p.checks = vec![RemoteCheck::OllamaAsk { url: "http://10.0.0.5:11434".into(), model: v.into(), timeout_ms: 3000 }];
+            assert!(build_script(&p).is_err(), "модель {v:?}");
             // Ошибка во вложенном хосте отклоняет весь скрипт.
             p = host("хост-а", "user@10.0.0.2");
             p.nested = vec![host("хост-б", v)];
@@ -278,6 +328,39 @@ mod tests {
         assert!(!s.contains("wg show all dump") && !s.contains("showconf"));
     }
 
+    #[test]
+    fn ollama_check_reads_two_endpoints_and_never_generates() {
+        let mut p = host("хост-а", "user@10.0.0.2");
+        p.checks = vec![RemoteCheck::Ollama { url: "http://10.0.0.5:11434".into(), timeout_ms: 5000 }];
+        let s = build_script(&p).unwrap();
+        assert!(s.contains("pult_sec 'хост-а' check.0 pult_ollama 'http://10.0.0.5:11434' 5 &"), "{s}");
+        assert!(s.contains(r#""$1/api/tags""#) && s.contains(r#""$1/api/ps""#));
+        assert!(s.contains("head -c 262144"), "тело ответа ограничено");
+        // Генерация грузит модель в память: в скрипте цикла её вызова нет вовсе.
+        assert!(!s.lines().any(|l| l.starts_with("pult_sec") && l.contains("pult_ask")), "{s}");
+    }
+
+    /// Вопрос модели идёт через ту же цепочку, но ждёт дольше обычного перехода.
+    #[test]
+    fn ask_goes_through_the_chain_with_its_own_limit() {
+        let mut leaf = host("хост-в", "user@10.0.0.5");
+        leaf.collectors = vec![];
+        leaf.checks = vec![RemoteCheck::OllamaAsk { url: "http://10.0.0.5:11434".into(), model: "qwen3:8b".into(), timeout_ms: 60_000 }];
+        let mut middle = host("хост-б", "user@10.0.0.4");
+        middle.nested = vec![leaf];
+        let mut outer = host("хост-а", "host-a");
+        outer.nested = vec![middle, host("хост-г", "host-d")];
+        let s = build_script(&outer).unwrap();
+        assert!(s.contains("pult_ssh 'хост-б' 75 'user@10.0.0.4' <<'PULT_EOF_1'"), "{s}");
+        assert!(s.contains("pult_ssh 'хост-в' 70 'user@10.0.0.5' <<'PULT_EOF_2'"), "{s}");
+        assert!(s.contains("pult_ssh 'хост-г' 15 'host-d' <<'PULT_EOF_1'"), "соседняя ветка ждёт как обычно");
+        let call = s.lines().find(|l| l.starts_with("pult_sec") && l.contains("pult_ask")).unwrap();
+        assert_eq!(
+            call,
+            r#"pult_sec 'хост-в' check.0 pult_ask 'http://10.0.0.5:11434' 60 '{"model":"qwen3:8b","options":{"num_predict":1},"prompt":"ping","stream":false}' &"#
+        );
+    }
+
     /// Синтаксис под dash — это /bin/sh на Debian и Ubuntu, где скрипт и выполняется.
     #[cfg(unix)]
     #[test]
@@ -285,7 +368,11 @@ mod tests {
         use std::io::Write;
         let mut p = host("хост-а", "user@10.0.0.2");
         p.collectors = vec![Collector::Docker, Collector::Wireguard, Collector::Proxmox];
-        p.checks = vec![RemoteCheck::Tcp { host: "10.0.0.3".into(), port: 22, timeout_ms: 3000 }];
+        p.checks = vec![
+            RemoteCheck::Tcp { host: "10.0.0.3".into(), port: 22, timeout_ms: 3000 },
+            RemoteCheck::Ollama { url: "http://10.0.0.5:11434".into(), timeout_ms: 5000 },
+            RemoteCheck::OllamaAsk { url: "http://10.0.0.5:11434".into(), model: "hf.co/org/model:Q4_K_M".into(), timeout_ms: 60_000 },
+        ];
         let mut inner = host("хост-б", "user@10.0.0.4");
         inner.nested = vec![host("хост-в", "user@10.0.0.5")];
         p.nested = vec![inner];
@@ -324,7 +411,8 @@ mod tests {
         let shell = ["/bin/dash", "/usr/bin/dash"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap_or("/bin/sh");
         let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
         let started = std::time::Instant::now();
-        let out = std::process::Command::new(shell).arg("-c").arg(format!("{PRELUDE}\n{body}")).env("PATH", path).output().unwrap();
+        let prelude = PRELUDE.replace("@LIMIT@", &BODY_LIMIT.to_string());
+        let out = std::process::Command::new(shell).arg("-c").arg(format!("{prelude}\n{body}")).env("PATH", path).output().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         (String::from_utf8_lossy(&out.stdout).into_owned(), started.elapsed())
     }

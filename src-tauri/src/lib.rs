@@ -3,6 +3,7 @@ mod collect;
 mod commands;
 mod engine;
 mod inventory;
+mod mcp;
 mod monitor;
 mod notify;
 mod probes;
@@ -78,6 +79,8 @@ pub fn run() {
             commands::open_logs,
             commands::close_logs,
             commands::open_url,
+            commands::ollama_ask,
+            commands::mcp_probe,
             sources::fleet::get_fleet,
         ])
         .on_window_event(|window, event| {

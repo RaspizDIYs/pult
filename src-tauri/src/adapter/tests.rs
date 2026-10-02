@@ -109,8 +109,8 @@ fn missing_section_is_unknown_and_remote_checks_map_back() {
     a.docker = Some(Outcome::Missing);
     a.wireguard = Some(Outcome::Failed { rc: 1, error: "wg: permission denied".into() });
     a.checks = vec![
-        Outcome::Ok(ProbeResult { connected: false, http_code: None, latency_ms: None, fact: "таймаут".into() }),
-        Outcome::Ok(ProbeResult { connected: true, http_code: Some(204), latency_ms: Some(12), fact: "HTTP 204".into() }),
+        Outcome::Ok(ProbeResult { fact: "таймаут".into(), ..ProbeResult::default() }),
+        Outcome::Ok(ProbeResult { connected: true, http_code: Some(204), latency_ms: Some(12), fact: "HTTP 204".into(), bodies: vec![] }),
     ];
     let s = states(&inv, &facts_from(&inv, vec![a]));
     assert_eq!(s["база"].own, OwnStatus::Unknown, "секция не получена — не «контейнера нет»");
@@ -170,4 +170,155 @@ fn ssh_failure_and_bad_plan_make_every_host_of_chain_unknown() {
     let bad = host_facts(&inv, plan, Err(PlanError("недопустимое значение".into())), NOW, Duration::from_secs(60));
     assert_eq!(bad.len(), 3);
     assert!(bad.iter().all(|(_, f)| f.result.is_err()));
+}
+
+const LLM: &str = r#"
+версия_схемы: 1
+узлы:
+  - {id: хост-а, название: Хост А, вид: хост, сбор: {ssh: "deploy@a.example.com", что: [docker]}}
+  - {id: хост-б, название: Хост Б, вид: хост, сбор: {ssh: "user@10.0.0.4", через: хост-а, ключ: "/home/deploy/.ssh/id_home", что: []}}
+  - id: модели
+    название: Локальные модели
+    вид: сервис
+    проверки:
+      - {вид: ollama, url: "http://10.0.0.5:11434", откуда: хост-б, ожидать_модели: [qwen3]}
+  - {id: проброс, название: Проброс, вид: сервис, проверки: [{вид: ollama, url: "http://10.0.0.4:11434/", откуда: хост-а}]}
+"#;
+
+fn llm() -> Inventory {
+    let (inv, warnings) = parse(LLM).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    validate(&inv).unwrap();
+    inv
+}
+
+fn body(bodies: &[&str]) -> Outcome<ProbeResult> {
+    Outcome::Ok(ProbeResult { connected: true, http_code: Some(200), latency_ms: Some(40), fact: "HTTP 200".into(), bodies: bodies.iter().map(|b| b.to_string()).collect() })
+}
+
+#[test]
+fn remote_ollama_bodies_are_parsed_like_local_ones() {
+    let inv = llm();
+    let plan = &plans(&inv)[0];
+    assert_eq!(plan.checks, [RemoteCheck::Ollama { url: "http://10.0.0.4:11434".into(), timeout_ms: 5000 }], "хвостовой «/» снят");
+    assert_eq!(plan.nested[0].checks, [RemoteCheck::Ollama { url: "http://10.0.0.5:11434".into(), timeout_ms: 5000 }]);
+
+    let tags = r#"{"models":[{"name":"qwen3:8b","size":5},{"name":"embed:latest","size":1}]}"#;
+    let ps = r#"{"models":[{"name":"qwen3:8b","size":10,"size_vram":10}]}"#;
+    let mut a = report("хост-а");
+    a.checks = vec![Outcome::Failed { rc: 0, error: "tags: ответ длиннее 256 КБ, обрезан".into() }];
+    let mut b = report("хост-б");
+    b.checks = vec![body(&[tags, ps])];
+    let s = states(&inv, &facts_from(&inv, vec![a, b]));
+    let check = &s["модели"].checks[0];
+    assert_eq!(s["модели"].own, OwnStatus::Ok);
+    assert_eq!(check.fact, "отвечает за 40 мс · моделей: 2 · в памяти: qwen3:8b (GPU)");
+    assert_eq!((check.models.as_slice(), check.from.as_deref(), check.latency_ms), (&["qwen3:8b".to_string(), "embed:latest".to_string()][..], Some("хост-б"), Some(40)));
+    let json = serde_json::to_value(check).unwrap();
+    assert_eq!((json["kind"].as_str(), json["models"][1].as_str()), (Some("ollama"), Some("embed:latest")));
+    // Обрезанный ответ — «узнать не удалось», а не отказ сервера.
+    assert_eq!(s["проброс"].own, OwnStatus::Unknown);
+    assert_eq!(s["проброс"].fact, "проверка на хост-а не выполнилась: tags: ответ длиннее 256 КБ, обрезан");
+
+    // Сервер жив, но нужной модели нет; сервер не отвечает; в ответе мусор.
+    let outcome = |o: Outcome<ProbeResult>| {
+        let mut b = report("хост-б");
+        b.checks = vec![o];
+        let s = states(&inv, &facts_from(&inv, vec![report("хост-а"), b]));
+        (s["модели"].own, s["модели"].fact.clone())
+    };
+    assert_eq!(outcome(body(&[r#"{"models":[{"name":"embed:latest"}]}"#])), (OwnStatus::Fail, "нет модели qwen3".into()));
+    let refused = Outcome::Ok(ProbeResult { fact: "соединение отклонено".into(), ..ProbeResult::default() });
+    assert_eq!(outcome(refused), (OwnStatus::Fail, "не отвечает: соединение отклонено".into()));
+    assert_eq!(outcome(body(&["<html>502</html>"])).1, "не отвечает: в ответе не список моделей Ollama: <html>502</html>");
+}
+
+#[test]
+fn ask_plan_follows_the_chain_and_answer_names_the_broken_hop() {
+    let inv = llm();
+    let plan = ask_plan(&inv, "хост-б", "http://10.0.0.5:11434", "qwen3:8b").unwrap();
+    assert_eq!((plan.id.as_str(), plan.collectors.len(), plan.checks.len()), ("хост-а", 0, 0), "по пути ничего не собирается");
+    let leaf = &plan.nested[0];
+    assert_eq!(leaf.hop, Hop { target: "user@10.0.0.4".into(), key: Some("/home/deploy/.ssh/id_home".into()) });
+    assert_eq!(leaf.checks, [RemoteCheck::OllamaAsk { url: "http://10.0.0.5:11434".into(), model: "qwen3:8b".into(), timeout_ms: 60_000 }]);
+    assert!(ask_plan(&inv, "модели", "http://10.0.0.5:11434", "qwen3:8b").is_err(), "с узла без «сбор» спросить нельзя");
+    assert_eq!(ollama_check(&inv.nodes[2]).map(|c| c.target()), Some("http://10.0.0.5:11434".into()));
+    assert!(ollama_check(&inv.nodes[0]).is_none());
+
+    let answered = |o: Outcome<ProbeResult>| {
+        let mut b = report("хост-б");
+        b.checks = vec![o];
+        ask_answer(Ok(vec![report("хост-а"), b]))
+    };
+    let mut done = body(&[r#"{"response":"","done":true,"load_duration":2500000000}"#]);
+    if let Outcome::Ok(p) = &mut done {
+        p.latency_ms = Some(3100);
+    }
+    assert_eq!(answered(done), ollama::Answer { ok: true, fact: "ответила за 3.1 с, из них загрузка в память — 2.5 с".into(), seconds: Some(3.1) });
+    let mut missing = body(&[r#"{"error":"model 'qwen3:8b' not found"}"#]);
+    if let Outcome::Ok(p) = &mut missing {
+        p.http_code = Some(404);
+    }
+    assert_eq!(answered(missing).fact, "model 'qwen3:8b' not found");
+    assert_eq!(answered(Outcome::Ok(ProbeResult { fact: "таймаут".into(), ..ProbeResult::default() })).fact, "таймаут");
+    assert_eq!(answered(Outcome::Missing).fact, "ответ не получен: предел времени или обрыв сеанса");
+
+    let mut down = report("хост-б");
+    down.ssh = Outcome::Failed { rc: 255, error: "ssh: connect to host 10.0.0.4 port 22: Connection timed out".into() };
+    let got = ask_answer(Ok(vec![report("хост-а"), down]));
+    assert_eq!((got.ok, got.fact.as_str()), (false, "до узла хост-б не дойти: ssh: connect to host 10.0.0.4 port 22: Connection timed out"));
+    assert!(!ask_answer(Err(PlanError("недопустимое значение".into()))).ok);
+}
+
+/// Живые серверы Ollama из своего инвентаря — тем же путём, что у приложения: цепочка ssh,
+/// скрипт сбора, разбор. Только `/api/tags` и `/api/ps`:
+/// `PULT_INVENTORY=каталог cargo test live_ollama -- --ignored --nocapture`
+/// С `PULT_LIVE_ASK=<модель>` — ещё и одна генерация этой моделью на первом сервере (путь кнопки
+/// «Спросить модель»). Она грузит модель в память и может вытеснить рабочую, поэтому модель
+/// называется явно: лучше всего ту, что уже в памяти.
+#[tokio::test]
+#[ignore = "ходит на свои серверы: PULT_INVENTORY"]
+async fn live_ollama() {
+    let dir = std::path::PathBuf::from(std::env::var("PULT_INVENTORY").expect("задай PULT_INVENTORY"));
+    let (inv, _) = parse(&std::fs::read_to_string(dir.join(crate::inventory::FILE_NAME)).unwrap()).unwrap();
+    validate(&inv).unwrap();
+    let ssh = crate::system::find("ssh");
+    let mut ask = std::env::var("PULT_LIVE_ASK").ok();
+    for node in &inv.nodes {
+        for check in node.checks.iter().filter(|c| c.kind == CheckKind::Ollama) {
+            let Some(from) = &check.from else {
+                let r = probes::run(check).await;
+                println!("{}: с этой машины · ok={:?} · {} · моделей {}", node.id, r.ok, r.fact, r.models.len());
+                continue;
+            };
+            let plan = chain_plan(&inv, from, remote(check)).unwrap();
+            let reports = collect::collect(ssh.as_deref(), &plan).await.unwrap();
+            for r in &reports {
+                println!("  ssh {}: {:?}", r.id, r.ssh);
+            }
+            let outcome = reports.last().unwrap().checks[0].clone();
+            let sizes: Vec<(String, u64)> = match &outcome {
+                Outcome::Ok(p) => {
+                    println!("  тел в ответе: {}, байт: {:?}", p.bodies.len(), p.bodies.iter().map(String::len).collect::<Vec<_>>());
+                    let tags: serde_json::Value = serde_json::from_str(p.bodies.first().map_or("", String::as_str)).unwrap_or_default();
+                    let models = tags["models"].as_array().cloned().unwrap_or_default();
+                    models.iter().map(|m| (m["name"].as_str().unwrap_or_default().to_string(), m["size"].as_u64().unwrap_or_default() >> 20)).collect()
+                }
+                other => {
+                    println!("  секция: {other:?}");
+                    Vec::new()
+                }
+            };
+            let r = remote_result(from, check, outcome, NOW);
+            println!("{}: с узла {from} · ok={:?} · {} · моделей {}", node.id, r.ok, r.fact, r.models.len());
+            println!("  модели и размеры, МБ: {sizes:?}");
+            if let Some(model) = ask.take() {
+                assert!(r.models.contains(&model), "модели {model} нет в списке сервера");
+                let plan = ask_plan(&inv, from, &check.target(), &model).unwrap();
+                let started = std::time::Instant::now();
+                let answer = ask_answer(collect::collect_within(ssh.as_deref(), &plan, ollama::ASK_LIMIT + Duration::from_secs(30)).await);
+                println!("  вопрос модели {model}: ok={} · {} · весь путь {:.1} с", answer.ok, answer.fact, started.elapsed().as_secs_f64());
+            }
+        }
+    }
 }

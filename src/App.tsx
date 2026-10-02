@@ -19,6 +19,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { UpdateBanner } from "@/components/update-banner";
 import { useFleet } from "@/lib/fleet";
 import { buildGraph, fmtTimeSec, summarize } from "@/lib/model";
+import { isLocal } from "@/lib/tree";
 import { errText, isTauri, pult, type NodeState, type NodeView } from "@/lib/pult";
 import { useUpdater } from "@/lib/updater";
 import { useNow, usePult } from "@/lib/use-pult";
@@ -53,6 +54,9 @@ export default function App() {
   const graph = useMemo(() => buildGraph(nodes), [nodes]);
   const summary = useMemo(() => summarize(nodes, states), [nodes, states]);
   const selected = selectedId ? (nodes.find((n) => n.id === selectedId) ?? null) : null;
+  // Карта есть, когда есть узлы инвентаря: одни MCP-серверы этой машины её не открывают —
+  // сначала человеку нужно сказать, куда смотреть.
+  const hasMap = nodes.some((n) => !isLocal(n));
 
   // Инвентарь поменялся, и выбранного узла больше нет — панель закрываем.
   useEffect(() => {
@@ -102,7 +106,7 @@ export default function App() {
   let body;
   if (!snapshot) {
     body = error ? <LoadErrorScreen error={error} onRetry={reload} /> : <LoadingScreen />;
-  } else if (!nodes.length) {
+  } else if (!hasMap) {
     const openSettings = () => setSettingsOpen(true);
     body =
       inv?.path === null ? (
@@ -167,7 +171,7 @@ export default function App() {
         )}
         <span className="flex-1" />
         {actionError && <span className="max-w-72 truncate text-xs text-root-fg" title={actionError}>{actionError}</span>}
-        {view === "map" && snapshot && nodes.length > 0 && (
+        {view === "map" && snapshot && hasMap && (
           <span className={silent ? "text-xs font-medium text-warn-fg" : "text-xs text-muted-foreground"} aria-live="off">
             {silent ? `Новых проверок нет с ${fmtTimeSec(new Date(cycleAt!).toISOString())}` : `Проверка № ${snapshot.cycle} · ${fmtTimeSec(new Date(cycleAt ?? Date.now()).toISOString())}`}
           </span>
@@ -177,7 +181,7 @@ export default function App() {
             <TriangleAlert /> Предупреждений: {warnings}
           </Button>
         )}
-        {view === "map" && snapshot && nodes.length > 0 && (
+        {view === "map" && snapshot && hasMap && (
           <Button size="sm" variant="outline" onClick={recheckAll}>
             <RefreshCw /> Проверить всё
           </Button>

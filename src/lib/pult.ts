@@ -7,13 +7,15 @@ import { listen } from "@tauri-apps/api/event";
 export type OwnStatus = "ok" | "fail" | "unknown" | "stale" | "unchecked";
 
 export interface CheckResult {
-  kind: "tcp" | "http" | "container" | "vm" | "collect";
+  kind: "tcp" | "http" | "container" | "vm" | "collect" | "ollama" | "mcp" | "process";
   target: string;
   from: string | null;
   ok: boolean | null;
   fact: string;
   latencyMs: number | null;
   measuredAt: string;
+  /** Только у `ollama`: модели сервера — из них выбирают, какую спросить. */
+  models?: string[];
 }
 
 export interface ContainerFacts {
@@ -53,6 +55,31 @@ export interface NodeView {
   links: { title: string; url: string }[];
   undeclared: boolean;
   hasLogs: boolean;
+  /** Только у узлов MCP (`kind: "mcp"`); значений переменных, заголовков и аргументов здесь нет. */
+  mcp?: McpInfo | null;
+}
+
+export interface McpInfo {
+  transport: "stdio" | "http" | "sse";
+  sources: string[];
+  command: string | null;
+  script: string | null;
+  host: string | null;
+  envNames: string[];
+  headerNames: string[];
+}
+
+/** Ответ «Спросить модель»: `fact` — «ответила за 3.2 с» либо текст ошибки сервера как есть. */
+export interface OllamaAnswer {
+  ok: boolean;
+  fact: string;
+  seconds: number | null;
+}
+
+/** Итог «Проверить по-настоящему»; он же остаётся строкой `mcp` в проверках узла. */
+export interface McpProbe {
+  ok: boolean;
+  fact: string;
 }
 
 export interface InventoryInfo {
@@ -163,6 +190,9 @@ export const pult = {
   getUpdateBlocker: () => call<string | null>("get_update_blocker"),
   // Ссылки из инвентаря открывает ядро в системном браузере: внутри окна Tauri `<a target>` не работает.
   openUrl: (url: string) => call<void>("open_url", { url }),
+  // Обе — только по кнопке: генерация грузит модель в память, проверка MCP запускает копию сервера.
+  ollamaAsk: (id: string, model: string) => call<OllamaAnswer>("ollama_ask", { id, model }),
+  mcpProbe: (id: string) => call<McpProbe>("mcp_probe", { id }),
 
   onSnapshot: (cb: (s: Snapshot) => void) => on("pult://snapshot", cb),
   onStates: (cb: (e: StatesEvent) => void) => on("pult://states", cb),

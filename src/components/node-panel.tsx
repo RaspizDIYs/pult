@@ -1,14 +1,15 @@
-import { CircleCheck, CircleHelp, CircleX, ExternalLink, RefreshCw, X } from "lucide-react";
+import { CircleCheck, CircleHelp, CircleX, ExternalLink, MessageSquare, PlugZap, RefreshCw, X } from "lucide-react";
 import { useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from "react";
 import { CopyButton } from "@/components/copy-button";
 import { HistoryTab, LogsTab } from "@/components/node-tabs";
 import { StatePlaque } from "@/components/state-plaque";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ago, dependentsOf, fmtDayTime, fmtDuration, fmtTime, kindInfo, TONE, toneOf, type Graph } from "@/lib/model";
-import { errText, pult, type CheckResult, type ContainerFacts, type NodeState, type NodeView } from "@/lib/pult";
+import { errText, pult, type CheckResult, type ContainerFacts, type McpInfo, type NodeState, type NodeView, type OllamaAnswer } from "@/lib/pult";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -26,6 +27,8 @@ interface Props {
 export function NodePanel({ node, state, nodes, states, graph, now, onSelect, onClose, className }: Props) {
   const tone = toneOf(state);
   const { Icon, label: kindLabel } = kindInfo(node.kind);
+  // Список моделей приносит проверка ollama — из него и только из него выбирают, какую спросить.
+  const models = state?.checks.find((c) => c.kind === "ollama" && c.models?.length)?.models;
   const titleOf = useMemo(() => {
     const m = new Map(nodes.map((n) => [n.id, n.title]));
     return (id: string) => m.get(id) ?? id;
@@ -77,7 +80,8 @@ export function NodePanel({ node, state, nodes, states, graph, now, onSelect, on
           </h2>
           <p className="truncate text-xs text-muted-foreground">
             {kindLabel}
-            {node.project ? ` · проект «${node.project}»` : ""}
+            {node.project && !node.mcp ? ` · проект «${node.project}»` : ""}
+            {node.mcp ? ` · ${node.mcp.transport} · эта машина` : ""}
             {node.group ? ` · группа «${node.group}»` : ""}
             {node.undeclared ? " · не описан в инвентаре" : ""}
           </p>
@@ -101,7 +105,10 @@ export function NodePanel({ node, state, nodes, states, graph, now, onSelect, on
         </TabsList>
 
         <TabsContent value="overview" className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-3">
-          <StateBlock tone={tone} state={state} now={now} />
+          {/* «Не запущен» у MCP — обычное состояние, а не «не проверяется»: процесса просто нет. */}
+          <StateBlock tone={tone} state={state} now={now} label={node.mcp && tone === "unchecked" ? "Не запущен" : undefined} />
+          {node.mcp && <McpBlock id={node.id} mcp={node.mcp} probe={state?.checks.find((c) => c.kind === "mcp")} />}
+          {models && models.length > 0 && <AskModel id={node.id} models={models} />}
 
           {state && state.blockedBy.length > 0 && (
             <Section title="Причина выше">
@@ -167,12 +174,12 @@ function Section({ title, note, children }: { title: string; note?: string; chil
   );
 }
 
-function StateBlock({ tone, state, now }: { tone: ReturnType<typeof toneOf>; state: NodeState | undefined; now: number }) {
+function StateBlock({ tone, state, now, label }: { tone: ReturnType<typeof toneOf>; state: NodeState | undefined; now: number; label?: string }) {
   if (!state) return <p className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">Ядро пока не прислало состояние этого узла.</p>;
   return (
     <section className={cn("rounded-lg border p-3", TONE[tone].box)}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <StatePlaque tone={tone} />
+        <StatePlaque tone={tone} label={label} />
         {!state.confirmed && <span className="text-xs opacity-80">ждёт подтверждения следующей проверкой</span>}
       </div>
       <p className="mt-2 text-sm font-medium break-words">
@@ -227,7 +234,144 @@ function Dependents({
   );
 }
 
-const CHECK_KIND: Record<CheckResult["kind"], string> = { tcp: "TCP", http: "HTTP", container: "Контейнер", vm: "ВМ", collect: "Сбор" };
+const CHECK_KIND: Record<CheckResult["kind"], string> = {
+  tcp: "TCP",
+  http: "HTTP",
+  container: "Контейнер",
+  vm: "ВМ",
+  collect: "Сбор",
+  ollama: "Ollama",
+  mcp: "MCP",
+  process: "Процесс",
+};
+
+// ───────────── Действия по кнопке ─────────────
+// Обе проверки цикл не делает: генерация грузит модель в память сервера, а проверка MCP
+// запускает вторую копию сервера. Поэтому рядом с кнопкой всегда сказано, чем она обернётся.
+
+function Verdict({ ok, children }: { ok: boolean; children: ReactNode }) {
+  const Icon = ok ? CircleCheck : CircleX;
+  return (
+    <p className={cn("mt-2 flex items-start gap-1.5 rounded-md border px-2.5 py-1.5 text-sm break-words", ok ? TONE.ok.box : TONE.root.box)}>
+      <Icon className="mt-0.5 size-4 shrink-0" aria-hidden />
+      <span className="min-w-0">{children}</span>
+    </p>
+  );
+}
+
+function AskModel({ id, models }: { id: string; models: string[] }) {
+  const [model, setModel] = useState(models[0]);
+  const [asking, setAsking] = useState(false);
+  const [answer, setAnswer] = useState<(OllamaAnswer & { model: string }) | null>(null);
+  // Список приходит с каждой проверкой: выбранной модели в нём может уже не быть.
+  const chosen = models.includes(model) ? model : models[0];
+
+  async function ask() {
+    setAsking(true);
+    setAnswer(null);
+    try {
+      setAnswer({ ...(await pult.ollamaAsk(id, chosen)), model: chosen });
+    } catch (e) {
+      setAnswer({ ok: false, fact: errText(e), seconds: null, model: chosen });
+    } finally {
+      setAsking(false);
+    }
+  }
+
+  return (
+    <Section
+      title="Спросить модель"
+      note="Настоящая генерация на один токен — только по этой кнопке. Модель загрузится в память сервера и может вытеснить ту, что сейчас в работе."
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <NativeSelect size="sm" className="max-w-full min-w-40" aria-label="Модель" value={chosen} disabled={asking} onChange={(e) => setModel(e.target.value)}>
+          {models.map((m) => (
+            <NativeSelectOption key={m} value={m}>
+              {m}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+        <Button size="sm" variant="outline" onClick={ask} disabled={asking}>
+          <MessageSquare className={cn(asking && "animate-pulse")} />
+          {asking ? "Жду ответа, до минуты…" : "Спросить модель"}
+        </Button>
+      </div>
+      <div aria-live="polite">
+        {answer && (
+          <Verdict ok={answer.ok}>
+            <span className="font-medium">{answer.model}:</span> {answer.fact}
+          </Verdict>
+        )}
+      </div>
+    </Section>
+  );
+}
+
+function McpBlock({ id, mcp, probe }: { id: string; mcp: McpInfo; probe: CheckResult | undefined }) {
+  const [probing, setProbing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Итог приходит и ответом команды, и состоянием узла (строка `mcp` в проверках) — показываем
+  // его из состояния: так он виден и после того, как панель закрыли и открыли снова.
+  async function run() {
+    setProbing(true);
+    setError(null);
+    try {
+      await pult.mcpProbe(id);
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setProbing(false);
+    }
+  }
+
+  const rows: [string, ReactNode][] = [["Вид", mcp.transport]];
+  if (mcp.command) rows.push(["Команда", <code className="font-mono text-xs">{mcp.command}</code>]);
+  if (mcp.script) rows.push(["Скрипт", <code className="font-mono text-xs break-all">{mcp.script}</code>]);
+  if (mcp.host) rows.push(["Адрес", <code className="font-mono text-xs break-all">{mcp.host}</code>]);
+  if (mcp.envNames.length) rows.push(["Переменные", <span className="font-mono text-xs break-all">{mcp.envNames.join(", ")}</span>]);
+  if (mcp.headerNames.length) rows.push(["Заголовки", <span className="font-mono text-xs break-all">{mcp.headerNames.join(", ")}</span>]);
+  rows.push(["Откуда взят", <ul>{mcp.sources.map((s) => <li key={s}>{s}</li>)}</ul>]);
+
+  return (
+    <>
+      <Section title="MCP-сервер" note="Найден в настройках Claude на этой машине. Значения переменных, заголовков и аргументы Пульт не показывает.">
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+          {rows.map(([k, v]) => (
+            <div key={k} className="contents">
+              <dt className="text-muted-foreground">{k}</dt>
+              <dd className="min-w-0 break-words">{v}</dd>
+            </div>
+          ))}
+        </dl>
+      </Section>
+      <Section
+        title="Проверить по-настоящему"
+        note={
+          mcp.transport === "stdio"
+            ? "Только по этой кнопке: на несколько секунд запустится вторая копия сервера — Пульт выполнит initialize и tools/list и завершит её."
+            : "Только по этой кнопке: Пульт отправит серверу initialize с заголовками из настроек Claude."
+        }
+      >
+        <Button size="sm" variant="outline" onClick={run} disabled={probing}>
+          <PlugZap className={cn(probing && "animate-pulse")} />
+          {probing ? "Проверяю, до 20 с…" : "Проверить по-настоящему"}
+        </Button>
+        <div aria-live="polite">
+          {error && <Verdict ok={false}>{error}</Verdict>}
+          {!probing && !error && probe && (
+            <Verdict ok={probe.ok === true}>
+              {probe.fact}
+              <span className="block text-xs opacity-85">
+                Проверено в {fmtTime(probe.measuredAt)}.{probe.ok === false ? " Отказ остаётся на карте до следующей проверки по-настоящему." : ""}
+              </span>
+            </Verdict>
+          )}
+        </div>
+      </Section>
+    </>
+  );
+}
 
 function Checks({ checks, titleOf }: { checks: CheckResult[]; titleOf: (id: string) => string }) {
   return (

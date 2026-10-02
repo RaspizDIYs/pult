@@ -4,11 +4,12 @@ use crate::commands::{
     EnvCheck, HistoryEntry, InventoryInfo, LogEnd, LogLines, NodeView, Settings, Snapshot, StatesEvent, EVENT_LOG,
     EVENT_LOG_END, EVENT_SNAPSHOT, EVENT_STATES,
 };
-use crate::engine::facts::{CheckKey, CheckResult, CycleGate, Facts};
+use crate::engine::facts::{CheckKey, CheckResult, CycleGate, Facts, ResultKind};
+use crate::probes::ollama;
 use crate::engine::{self, NodeState};
 use crate::inventory::{self, Inventory, InventoryState};
 use crate::notify::Notifier;
-use crate::{adapter, collect, notify, probes, store, system, tray};
+use crate::{adapter, collect, mcp, notify, probes, store, system, tray};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +36,7 @@ pub struct Monitor {
     state: Mutex<State>,
     recheck: Notify,
     collect_now: Notify,
+    mcp_now: Notify,
     /// Открытые потоки логов: закрытие отправителя — отмена.
     logs: Mutex<HashMap<String, oneshot::Sender<()>>>,
     next_log: AtomicU64,
@@ -58,6 +60,8 @@ struct State {
     collect_gate: CycleGate,
     /// Узлы последнего отправленного снимка: неописанные контейнеры приходят и уходят.
     node_ids: Vec<String>,
+    /// MCP-серверы этой машины: мимо инвентаря и движка, со своим циклом обхода.
+    mcp: mcp::Local,
 }
 
 impl Monitor {
@@ -76,6 +80,7 @@ impl Monitor {
             state: Mutex::new(state),
             recheck: Notify::new(),
             collect_now: Notify::new(),
+            mcp_now: Notify::new(),
             logs: Mutex::new(HashMap::new()),
             next_log: AtomicU64::new(1),
         });
@@ -83,6 +88,7 @@ impl Monitor {
         tauri::async_runtime::spawn(monitor.clone().schedule());
         tauri::async_runtime::spawn(monitor.clone().collect_loop());
         tauri::async_runtime::spawn(monitor.clone().pull_loop());
+        tauri::async_runtime::spawn(monitor.clone().mcp_loop());
         monitor
     }
 
@@ -100,6 +106,7 @@ impl Monitor {
     /// Сбор запускается в обоих случаях: контейнеры и проверки «откуда» знает только он.
     pub fn recheck(self: &Arc<Self>, id: Option<String>) {
         self.collect_now.notify_one();
+        self.mcp_now.notify_one();
         match id {
             None => self.recheck.notify_one(),
             Some(id) => {
@@ -333,9 +340,79 @@ impl Monitor {
         self.emit(EVENT_STATES, StatesEvent { cycle, states });
     }
 
+    /// «Спросить модель»: одна генерация на сервере первой проверки `ollama` узла. С этой машины
+    /// или с узла `откуда` — тем же путём, каким идёт сама проверка.
+    pub async fn ask_model(&self, id: &str, model: &str) -> Result<ollama::Answer, String> {
+        let (inv, check) = self.lock().ask_target(id, model)?;
+        log::info!("вопрос модели: узел {id}");
+        Ok(match &check.from {
+            None => ollama::ask(&check.target(), model).await,
+            Some(from) => {
+                let plan = adapter::ask_plan(&inv, from, &check.target(), model)?;
+                let ssh = system::find("ssh");
+                // Предел сеанса — предел генерации плюс запас на переходы ssh.
+                let limit = ollama::ASK_LIMIT + Duration::from_secs(30);
+                adapter::ask_answer(collect::collect_within(ssh.as_deref(), &plan, limit).await)
+            }
+        })
+    }
+
+    /// Обход MCP-серверов этой машины: настройки Claude и пассивное состояние. Свой цикл, а не
+    /// часть цикла проверок: список процессов и чужие порты не должны задерживать карту.
+    async fn mcp_loop(self: Arc<Self>) {
+        let Some(paths) = mcp::Paths::of_user() else { return };
+        loop {
+            let (servers, errors) = mcp::discover(&paths);
+            let passive = mcp::scan(&servers).await;
+            {
+                let mut s = self.lock();
+                let update = s.mcp.update(&paths, servers, errors, passive, engine::now());
+                self.after_mcp(&mut s, update);
+            }
+            let _ = tokio::time::timeout(probes::INTERVAL, self.mcp_now.notified()).await;
+        }
+    }
+
+    /// «Проверить по-настоящему»: рукопожатие с сервером. Итог остаётся на узле до следующего
+    /// нажатия (см. `mcp::Local`).
+    pub async fn probe_mcp(&self, id: &str) -> Result<mcp::handshake::Probe, String> {
+        let server = self.lock().mcp.server(id).ok_or_else(|| format!("сервера «{id}» нет в настройках Claude"))?;
+        log::info!("проверка MCP по-настоящему: {}", server.name);
+        let probe = mcp::handshake::probe(&server, mcp::handshake::LIMIT).await;
+        let now = engine::now();
+        let result = CheckResult {
+            kind: ResultKind::Mcp,
+            target: "initialize и tools/list".into(),
+            from: None,
+            ok: Some(probe.ok),
+            fact: probe.fact.clone(),
+            latency_ms: None,
+            measured_at: now,
+            models: Vec::new(),
+        };
+        let mut s = self.lock();
+        let update = s.mcp.set_real(id, &server, result, now);
+        self.after_mcp(&mut s, update);
+        Ok(probe)
+    }
+
+    /// После обхода или проверки MCP: история, трей, событие. Уведомлений нет: пассивное
+    /// состояние — не тревога, а итог настоящей проверки человек видит там же, где нажал кнопку.
+    fn after_mcp(&self, s: &mut State, update: mcp::Update) {
+        if let Err(e) = store::append_history(&self.data_dir, &update.transitions) {
+            log::warn!("история не записалась: {e}");
+        }
+        self.after_change(s);
+        if update.list_changed {
+            self.emit(EVENT_SNAPSHOT, s.snapshot());
+        } else if !update.states.is_empty() {
+            self.emit(EVENT_STATES, StatesEvent { cycle: s.cycle, states: update.states });
+        }
+    }
+
     /// Трей — по текущим корням, без ожидания подтверждения: это сводка, а не тревога.
     fn after_change(&self, s: &mut State) {
-        let roots = s.states.values().filter(|st| st.is_root).count();
+        let roots = s.states.values().chain(s.mcp.states().values()).filter(|st| st.is_root).count();
         if s.tray_roots != Some(roots) {
             s.tray_roots = Some(roots);
             tray::update(&self.app, roots);
@@ -382,6 +459,7 @@ impl State {
             collects_done: 0,
             collect_gate: CycleGate::default(),
             node_ids: Vec::new(),
+            mcp: mcp::Local::default(),
         };
         state.evaluate(data_dir);
         state
@@ -435,6 +513,20 @@ impl State {
         Some(self.evaluate(data_dir))
     }
 
+    /// К какому серверу пойдёт «Спросить модель». Имя модели — только из списка, который сервер
+    /// сам отдал последней проверке: интерфейс его не выдумывает, а в скрипт сбора не попадает
+    /// ничего постороннего.
+    fn ask_target(&self, id: &str, model: &str) -> Result<(Inventory, inventory::Check), String> {
+        let inv = self.inventory.inventory();
+        let node = inv.nodes.iter().find(|n| n.id == id).ok_or_else(|| format!("узла «{id}» нет на карте"))?;
+        let check = adapter::ollama_check(node).cloned().ok_or_else(|| format!("у «{}» нет проверки ollama", node.title))?;
+        let known = self.states.get(id).is_some_and(|st| st.checks.iter().any(|c| c.kind == ResultKind::Ollama && c.models.iter().any(|m| m == model)));
+        if !known || !collect::is_plain(model) {
+            return Err(format!("модели «{model}» нет в списке сервера"));
+        }
+        Ok((inv, check))
+    }
+
     /// Принятый инвентарь плюс неописанные контейнеры, которые увидел сбор.
     fn effective_inventory(&self) -> Inventory {
         let mut inv = self.inventory.inventory();
@@ -474,6 +566,11 @@ impl State {
         // Скрытые узлы остаются в движке (их контейнер не превращается в «не описан»), но ни на
         // карту, ни в счётчики интерфейса не попадают.
         let hidden: HashSet<&str> = inv.nodes.iter().filter(|n| n.hidden).map(|n| n.id.as_str()).collect();
+        // Узлы MCP — после узлов инвентаря; id с «#» в инвентаре не бывает, но если кто-то так
+        // назвал свой узел, побеждает инвентарь.
+        let taken: HashSet<&str> = inv.nodes.iter().map(|n| n.id.as_str()).collect();
+        let local: Vec<NodeView> = self.mcp.views().into_iter().filter(|v| !taken.contains(v.id.as_str())).collect();
+        let local_states = self.mcp.states().iter().filter(|(id, _)| !taken.contains(id.as_str()));
         Snapshot {
             cycle: self.cycle,
             taken_at: self.taken_at,
@@ -489,8 +586,9 @@ impl State {
                 .iter()
                 .filter(|n| !n.hidden)
                 .map(|n| NodeView { undeclared: !declared.contains(n.id.as_str()), ..NodeView::new(n, &inv) })
+                .chain(local)
                 .collect(),
-            states: self.states.iter().filter(|(id, _)| !hidden.contains(id.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect(),
+            states: self.states.iter().filter(|(id, _)| !hidden.contains(id.as_str())).chain(local_states).map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
 }
@@ -579,6 +677,61 @@ mod tests {
         let snap = state.snapshot();
         assert_eq!(snap.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["а"]);
         assert!(!snap.states.contains_key("заглушка"));
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(catalog);
+    }
+
+    /// Модель для «Спросить модель» — только из списка последней проверки этого узла.
+    #[test]
+    fn model_to_ask_must_come_from_the_server_list() {
+        let data = temp_data("ask");
+        let catalog = temp_data("ask-catalog");
+        let yaml = "версия_схемы: 1\nузлы:\n  - {id: модели, название: Модели, вид: сервис, проверки: [{вид: ollama, url: \"http://10.0.0.5:11434\"}]}\n  - {id: а, название: А, вид: хост, проверки: [{вид: tcp, адрес: \"a:1\"}]}\n";
+        std::fs::write(catalog.join(inventory::FILE_NAME), yaml).unwrap();
+        let mut state = State::new(&data, Settings { inventory_path: Some(catalog.display().to_string()), ..Settings::default() });
+        assert!(state.ask_target("модели", "qwen3:8b").is_err(), "списка ещё нет");
+        let (inv, cycle) = state.begin_cycle(None);
+        let mut result = probes::tests::ok_result(&inv.nodes[0].checks[0]);
+        result.kind = ResultKind::Ollama;
+        result.models = vec!["qwen3:8b".into()];
+        state.finish_cycle(cycle, vec![(("модели".into(), 0), result)], &data).unwrap();
+        let (_, check) = state.ask_target("модели", "qwen3:8b").unwrap();
+        assert_eq!(check.target(), "http://10.0.0.5:11434");
+        assert_eq!(state.ask_target("модели", "qwen3:99b").unwrap_err(), "модели «qwen3:99b» нет в списке сервера");
+        assert!(state.ask_target("а", "qwen3:8b").unwrap_err().contains("нет проверки ollama"));
+        assert!(state.ask_target("нет-такого", "qwen3:8b").is_err());
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(catalog);
+    }
+
+    /// Узлы MCP — в снимке рядом с узлами инвентаря, мимо движка; инвентарь при совпадении id главнее.
+    #[test]
+    fn mcp_nodes_join_the_snapshot_without_touching_the_inventory() {
+        use std::collections::BTreeMap;
+        let data = temp_data("mcp");
+        let catalog = temp_data("mcp-catalog");
+        let yaml = "версия_схемы: 1\nузлы:\n  - {id: а, название: А, вид: хост}\n  - {id: \"#mcp/занят\", название: Свой узел, вид: сервис}\n";
+        std::fs::write(catalog.join(inventory::FILE_NAME), yaml).unwrap();
+        let mut state = State::new(&data, Settings { inventory_path: Some(catalog.display().to_string()), ..Settings::default() });
+        let server = |name: &str| mcp::Server {
+            name: name.into(),
+            sources: vec!["Claude Desktop".into()],
+            cwd: None,
+            transport: mcp::Transport::Stdio { command: "node".into(), args: vec!["server.js".into()], env: BTreeMap::new() },
+        };
+        let servers = vec![server("вики"), server("занят")];
+        let seen = |fact: &str| CheckResult { kind: ResultKind::Process, target: "процесс сервера".into(), from: None, ok: None, fact: fact.into(), latency_ms: None, measured_at: engine::now(), models: vec![] };
+        let paths = mcp::Paths::in_home(data.clone());
+        let update = state.mcp.update(&paths, servers, vec![], vec![seen("не запущен"), seen("не запущен")], engine::now());
+        assert!(update.list_changed);
+        let snap = state.snapshot();
+        let ids: Vec<&str> = snap.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["а", "#mcp/занят", "#mcp/вики"]);
+        assert_eq!(snap.nodes[1].title, "Свой узел", "узел инвентаря не подменён");
+        assert_eq!(snap.states["#mcp/вики"].own, engine::OwnStatus::Unchecked);
+        assert_eq!(snap.states["#mcp/занят"].own, engine::OwnStatus::Unchecked, "состояние — от движка: у узла инвентаря нет проверок");
+        assert_eq!(snap.states["#mcp/занят"].fact, "не проверяется");
+        assert_eq!(state.inventory.inventory().nodes.len(), 2, "в инвентарь узлы MCP не попадают");
         let _ = std::fs::remove_dir_all(data);
         let _ = std::fs::remove_dir_all(catalog);
     }

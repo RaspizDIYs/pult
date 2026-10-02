@@ -6,7 +6,7 @@ use crate::collect::{self, Hop, HostPlan, HostReport, Outcome, PlanError, Remote
 use crate::engine::container_matches;
 use crate::engine::facts::{CheckKey, CheckResult, Collected, Facts, HostFacts};
 use crate::inventory::{Check, CheckKind, Collect, Collector, Expected, Inventory, Node, NodeKind};
-use crate::probes;
+use crate::probes::{self, ollama};
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -67,6 +67,7 @@ fn remote(check: &Check) -> RemoteCheck {
             RemoteCheck::Tcp { host: host.to_string(), port: port.parse().unwrap_or_default(), timeout_ms }
         }
         CheckKind::Http => RemoteCheck::Http { url: check.target(), timeout_ms },
+        CheckKind::Ollama => RemoteCheck::Ollama { url: check.target(), timeout_ms },
     }
 }
 
@@ -144,8 +145,14 @@ fn last_line(text: &str, fallback: &str) -> String {
 }
 
 fn remote_result(host: &str, check: &Check, outcome: Outcome<collect::ProbeResult>, now: OffsetDateTime) -> CheckResult {
+    let mut models = Vec::new();
     let (ok, fact, latency_ms) = match outcome {
         Outcome::Ok(p) => match check.kind {
+            CheckKind::Ollama => {
+                let v = ollama::verdict(reply(&p), p.bodies.get(1).map(String::as_str), p.latency_ms, &check.expect_models);
+                models = v.models;
+                (Some(v.ok), v.fact, v.latency_ms)
+            }
             CheckKind::Tcp => {
                 let port = probes::port_of(check.address.as_deref().unwrap_or_default());
                 let fact = if p.connected { format!("порт {port}: открыт") } else { format!("порт {port}: {}", p.fact) };
@@ -173,6 +180,68 @@ fn remote_result(host: &str, check: &Check, outcome: Outcome<collect::ProbeResul
         fact,
         latency_ms,
         measured_at: now,
+        models,
+    }
+}
+
+/// Ответ удалённого запроса к Ollama в том виде, в каком его разбирает `probes::ollama`.
+fn reply(p: &collect::ProbeResult) -> Result<(u16, &str), String> {
+    match (p.connected, p.http_code) {
+        (true, Some(code)) => Ok((code, p.bodies.first().map_or("", String::as_str))),
+        _ => Err(p.fact.clone()),
+    }
+}
+
+/// Первая проверка `ollama` узла — к её серверу идёт «Спросить модель».
+pub fn ollama_check(node: &Node) -> Option<&Check> {
+    node.checks.iter().find(|c| c.kind == CheckKind::Ollama)
+}
+
+/// План одной генерации с узла `host` — кнопка «Спросить модель».
+pub fn ask_plan(inv: &Inventory, host: &str, url: &str, model: &str) -> Result<HostPlan, String> {
+    let ask = RemoteCheck::OllamaAsk { url: url.to_string(), model: model.to_string(), timeout_ms: ollama::ASK_LIMIT.as_millis() as u32 };
+    chain_plan(inv, host, ask)
+}
+
+/// Цепочка ssh до узла `host` по `через`, без сборщиков, с единственной проверкой на последнем
+/// хосте. Идёт тем же путём, что и сбор: скрипт, пределы, разбор секций.
+fn chain_plan(inv: &Inventory, host: &str, check: RemoteCheck) -> Result<HostPlan, String> {
+    let mut plan: Option<HostPlan> = None;
+    let mut cur = Some(host);
+    while let Some(id) = cur {
+        let c = inv.nodes.iter().find(|n| n.id == id).and_then(|n| n.collect.as_ref());
+        let c = c.ok_or_else(|| format!("с узла {id} ничего не собирается: зайти не через что"))?;
+        plan = Some(HostPlan {
+            id: id.to_string(),
+            hop: hop(c),
+            collectors: Vec::new(),
+            checks: if plan.is_none() { vec![check.clone()] } else { Vec::new() },
+            nested: plan.into_iter().collect(),
+        });
+        cur = c.via.as_deref();
+    }
+    plan.ok_or_else(|| "пустая цепочка ssh".to_string())
+}
+
+/// Ответ `ask_plan` → ответ кнопки. Узел с вопросом — последний в отчёте; не дошли до него —
+/// говорим, на каком переходе встали.
+pub fn ask_answer(result: Result<Vec<HostReport>, PlanError>) -> ollama::Answer {
+    let fail = |fact: String| ollama::Answer { ok: false, fact, seconds: None };
+    let reports = match result {
+        Ok(reports) => reports,
+        Err(e) => return fail(e.to_string()),
+    };
+    for r in &reports {
+        match &r.ssh {
+            Outcome::Ok(()) => {}
+            Outcome::Failed { error, .. } => return fail(format!("до узла {} не дойти: {}", r.id, last_line(error, "ssh не удался"))),
+            Outcome::Missing => return fail(format!("сеанс не дошёл до узла {}", r.id)),
+        }
+    }
+    match reports.last().and_then(|r| r.checks.first()) {
+        Some(Outcome::Ok(p)) => ollama::answer(reply(p), p.latency_ms.unwrap_or_default()),
+        Some(Outcome::Failed { error, .. }) => fail(last_line(error, "запрос не выполнился")),
+        Some(Outcome::Missing) | None => fail("ответ не получен: предел времени или обрыв сеанса".to_string()),
     }
 }
 

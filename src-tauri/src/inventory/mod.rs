@@ -79,6 +79,10 @@ pub enum NodeKind {
     Service,
     #[serde(rename = "туннель")]
     Tunnel,
+    /// MCP-сервер из настроек Claude на этой машине. Такие узлы Пульт находит сам (`crate::mcp`),
+    /// в инвентаре вида нет: `skip_deserializing` отклонит `вид: mcp` как незнакомый.
+    #[serde(rename = "mcp", skip_deserializing)]
+    Mcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -92,7 +96,7 @@ pub enum Expected {
     Any,
 }
 
-/// Одна плоская структура на оба вида: так незнакомые поля внутри проверки тоже
+/// Одна плоская структура на все виды: так незнакомые поля внутри проверки тоже
 /// попадают в предупреждения (у enum с тегом serde прячет их от serde_ignored).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Check {
@@ -108,12 +112,20 @@ pub struct Check {
     pub timeout_ms: Option<u64>,
     #[serde(rename = "откуда", default)]
     pub from: Option<String>,
+    /// Только у `ollama`: модели, без которых сервер считается неисправным.
+    #[serde(rename = "ожидать_модели", default)]
+    pub expect_models: Vec<String>,
 }
 
 impl Check {
-    /// Что проверяем, по-человечески: адрес или url.
+    /// Что проверяем, по-человечески: адрес или url. У `ollama` хвостовой «/» снят: к адресу
+    /// сервера приписывается путь API.
     pub fn target(&self) -> String {
-        self.address.clone().or_else(|| self.url.clone()).unwrap_or_default()
+        let target = self.address.clone().or_else(|| self.url.clone()).unwrap_or_default();
+        match self.kind {
+            CheckKind::Ollama => target.trim_end_matches('/').to_string(),
+            _ => target,
+        }
     }
 }
 
@@ -123,6 +135,8 @@ pub enum CheckKind {
     Tcp,
     #[serde(rename = "http")]
     Http,
+    #[serde(rename = "ollama")]
+    Ollama,
 }
 
 /// `ожидать: 200` или `ожидать: [200, 204]`.
@@ -335,6 +349,19 @@ pub fn validate(inv: &Inventory) -> Result<(), String> {
                     Some(u) if u.starts_with("http://") || u.starts_with("https://") => {}
                     _ => errors.push(format!("{at}: http нужен «url» с http:// или https://")),
                 },
+                // Адрес сервера и имена моделей уходят в скрипт сбора (проверка с узла и кнопка
+                // «Спросить модель»), поэтому белый список — всегда, а не только при «откуда».
+                CheckKind::Ollama => {
+                    if !ch.url.as_deref().is_some_and(crate::collect::is_url) {
+                        errors.push(format!("{at}: ollama нужен «url» сервера: http:// или https://, без пробелов и кавычек"));
+                    }
+                    if !ch.expect_models.iter().all(|m| crate::collect::is_plain(m)) {
+                        errors.push(format!("{at}: «ожидать_модели» содержит недопустимые символы (можно буквы, цифры и @ . _ - / ~ :)"));
+                    }
+                }
+            }
+            if ch.kind != CheckKind::Ollama && !ch.expect_models.is_empty() {
+                errors.push(format!("{at}: «ожидать_модели» есть только у проверки ollama"));
             }
             if let Some(from) = &ch.from {
                 need_node(&mut errors, &at, "откуда", from, true);
@@ -342,7 +369,7 @@ pub fn validate(inv: &Inventory) -> Result<(), String> {
                 // цепочки, поэтому ловим его здесь, по тому же белому списку.
                 let ok = match ch.kind {
                     CheckKind::Tcp => ch.address.as_deref().and_then(|a| a.rsplit_once(':')).is_some_and(|(h, _)| crate::collect::is_plain(h)),
-                    CheckKind::Http => ch.url.as_deref().is_some_and(crate::collect::is_url),
+                    CheckKind::Http | CheckKind::Ollama => ch.url.as_deref().is_some_and(crate::collect::is_url),
                 };
                 if !ok {
                     errors.push(format!("{at}: адрес для проверки на узле содержит недопустимые символы"));
@@ -518,6 +545,24 @@ mod tests {
         }
         let e = err("версия_схемы: 1\nузлы:\n  - {id: а, название: А, вид: хост, сбор: {ssh: a, ключ: \"~/key`id`\"}}\n");
         assert!(e.contains("«ключ» содержит недопустимые символы"), "{e}");
+    }
+
+    #[test]
+    fn ollama_check_and_expected_models() {
+        let node = |check: &str| format!("версия_схемы: 1\nузлы:\n  - {{id: а, название: А, вид: сервис, проверки: [{check}]}}\n");
+        let (inv, warnings) = parse(&node(r#"{вид: ollama, url: "http://10.0.0.5:11434/", ожидать_модели: ["qwen3:8b", llama3]}"#)).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        validate(&inv).unwrap();
+        let check = &inv.nodes[0].checks[0];
+        assert_eq!((check.kind, check.target().as_str()), (CheckKind::Ollama, "http://10.0.0.5:11434"));
+        assert_eq!(check.expect_models, ["qwen3:8b", "llama3"]);
+
+        assert!(err(&node("{вид: ollama}")).contains("ollama нужен «url»"));
+        assert!(err(&node(r#"{вид: ollama, url: "http://10.0.0.5:11434/$(reboot)"}"#)).contains("ollama нужен «url»"));
+        assert!(err(&node(r#"{вид: ollama, url: "http://10.0.0.5:11434", ожидать_модели: ["a\"; reboot"]}"#)).contains("«ожидать_модели» содержит"));
+        assert!(err(&node(r#"{вид: tcp, адрес: "a:1", ожидать_модели: [x]}"#)).contains("только у проверки ollama"));
+        // Узлы MCP Пульт находит сам: из инвентаря такой вид не принимается.
+        assert!(err("версия_схемы: 1\nузлы:\n  - {id: а, название: А, вид: mcp}\n").contains("unknown variant"));
     }
 
     #[test]
