@@ -42,6 +42,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # тянет Secret Service для Linux, которого у Пульта нет. Без фич платформ keyring молча
 # берёт хранилище в памяти, поэтому фичи обязательны.
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native"] }
+tauri-plugin-single-instance = "=2.5.2"
 
 [profile.release]
 strip = true

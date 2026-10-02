@@ -27,7 +27,21 @@ pub fn run() {
     });
     let hidden = std::env::args().any(|arg| arg == HIDDEN_FLAG);
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    // Второй запуск не должен плодить второй трей и второй набор проверок: он будит окно первого
+    // и выходит. Плагин обязан идти первым — он завершает процесс до остальных плагинов.
+    // Флагам обновления он мешал бы: при работающем Пульте `--check-update` молча вышел бы.
+    // В отладочной сборке выключен: `tauri dev` должен запускаться рядом с установленным приложением.
+    if cli_apply.is_none() && !cfg!(debug_assertions) {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // Автозапуск при уже открытом Пульте окно не поднимает.
+            if !args.iter().any(|arg| arg == HIDDEN_FLAG) {
+                tray::show_window(app);
+            }
+        }));
+    }
+
+    builder
         .plugin(
             // Только в файл: stdout занят выводом диагностических флагов.
             tauri_plugin_log::Builder::new()
