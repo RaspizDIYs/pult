@@ -1044,10 +1044,17 @@ impl Fleet {
 
     fn hub_ok(&self, v: &Value, address: &Option<String>) {
         let part = parse_hub(v, now_ms());
+        // В лог — только возвращение хаба, а не каждый снимок: по логу видно, когда рой был на связи.
+        let summary = format!("сессий в сети {}, общих замков {}", part.seen.len(), part.locks.len());
+        let mut came_back = false;
         self.publish(|s| {
+            came_back = s.hub.state != HubState::Ok;
             s.hub_part = Some(part);
             s.hub = HubInfo { state: HubState::Ok, address: address.clone(), error: None, last_ok_at: Some(iso(now_ms())) };
         });
+        if came_back {
+            log::info!("рой: хаб на связи ({}): {summary}", address.as_deref().unwrap_or("?"));
+        }
     }
 
     /// Хаб пропал — его данные убираем, а не показываем застывшими: старый снимок замков
@@ -1172,7 +1179,10 @@ impl Fleet {
 
 #[tauri::command]
 pub fn get_fleet(fleet: State<'_, Arc<Fleet>>) -> FleetView {
-    fleet.view()
+    let view = fleet.view();
+    // Зовётся раз на открытие окна — строка в логе не шумит, а отвечает, дошло ли окно до роя.
+    log::info!("рой: get_fleet — хаб {:?}, сессий {}, проблем {}", view.hub.state, view.sessions.len(), view.problems);
+    view
 }
 
 #[cfg(test)]

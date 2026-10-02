@@ -2,6 +2,7 @@
 // Свой выбор между ядром и макетом, как в ./pult: экран роя не трогает макет карты, и наоборот.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { info } from "@tauri-apps/plugin-log";
 import { useEffect, useState } from "react";
 import { fmtDuration } from "./model";
 import { errText, isTauri } from "./pult";
@@ -117,7 +118,11 @@ export function useFleet() {
   useEffect(() => {
     let dead = false;
     let off: (() => void) | null = null;
+    let first = true;
     onFleet((v) => {
+      // Первое событие — в лог приложения: так видно, что поток от ядра до окна работает.
+      if (first && isTauri) void info(`окно: первое pult://fleet — хаб ${v.hub.state}, сессий ${v.sessions.length}, проблем ${v.problems}`).catch(() => {});
+      first = false;
       setView(v);
       setError(null);
     }).then(
@@ -126,7 +131,11 @@ export function useFleet() {
     );
     getFleet().then(
       (v) => !dead && setView((prev) => prev ?? v),
-      (e) => !dead && setError(errText(e)),
+      (e) => {
+        // console.warn в окне Tauri уходит в лог приложения (main.tsx).
+        console.warn(`get_fleet: ${errText(e)}`);
+        if (!dead) setError(errText(e));
+      },
     );
     return () => {
       dead = true;
